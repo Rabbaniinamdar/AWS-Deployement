@@ -5327,3 +5327,2712 @@ Verification:
 ```
 
 ---
+# CitiCore Banking Platform - AWS Deployment: Comprehensive Detailed Notes
+
+**Complete guide to deploying a microservices banking application on AWS ECS Fargate with Spring Cloud, Eureka service discovery, Kafka event streaming, and ALB load balancing.**
+
+---
+
+## Table of Contents
+
+1. [Deployment Order Strategy](#deployment-order-strategy)
+2. [Amazon ECR (Elastic Container Registry)](#amazon-ecr-elastic-container-registry)
+3. [Amazon ECS and Fargate](#amazon-ecs-and-fargate)
+4. [ECS Task Definition](#ecs-task-definition)
+5. [ECS Service](#ecs-service)
+6. [VPC and Networking](#vpc-and-networking)
+7. [IAM Roles](#iam-roles)
+8. [Spring Cloud Config Server](#spring-cloud-config-server)
+9. [Eureka Service Discovery](#eureka-service-discovery)
+10. [ECS Service Connect](#ecs-service-connect)
+11. [Application Load Balancer (ALB)](#application-load-balancer-alb)
+12. [Auth Service Deployment](#auth-service-deployment)
+13. [Real Issues & Troubleshooting](#real-issues--troubleshooting)
+14. [Kafka Event Streaming](#kafka-event-streaming)
+15. [Key Lessons Learned](#key-lessons-learned)
+
+---
+
+## Deployment Order Strategy
+
+### Definition
+
+**Deployment Order** refers to the sequence in which infrastructure components and microservices are deployed in a distributed system. It ensures that dependent services are not deployed before their dependencies are ready.
+
+### What You Implemented
+
+```
+AWS Infrastructure (VPC, RDS, Security Groups, Subnets)
+        ↓
+Config Server (Centralized configuration management)
+        ↓
+Eureka Server (Service discovery registry)
+        ↓
+Auth Service (Authentication microservice)
+        ↓
+User Service (User management)
+        ↓
+Account Service (Account operations)
+        ↓
+Transaction Service (Transaction processing)
+        ↓
+Notification Service (Email/SMS notifications)
+        ↓
+API Gateway (External request entry point)
+```
+
+### Why This Approach
+
+**Without proper deployment order:**
+
+```
+Problem: Deploy Auth Service first
+    ↓
+Auth Service tries to register with Eureka
+    ↓
+Eureka not running yet
+    ↓
+Auth Service startup fails
+    ↓
+Application hangs or crashes
+```
+
+**With proper deployment order:**
+
+```
+1. Deploy infrastructure (VPC ready)
+2. Deploy Config Server (configuration available)
+3. Deploy Eureka (service registry ready)
+4. Deploy Auth Service (can register with Eureka)
+5. Deploy other services (can discover each other)
+```
+
+### Step-by-Step Process
+
+**Step 1: Prepare AWS Infrastructure**
+
+```bash
+# Create VPC
+aws ec2 create-vpc --cidr-block 10.0.0.0/16 --region ap-south-1
+
+# Create subnets
+aws ec2 create-subnet --vpc-id vpc-xxx --cidr-block 10.0.1.0/24 --region ap-south-1
+
+# Create security groups
+aws ec2 create-security-group --group-name citicore-ecs-sg --vpc-id vpc-xxx --region ap-south-1
+```
+
+**Step 2: Deploy Config Server**
+
+```bash
+# Build Docker image
+docker build -t citicore/config-server:1.0 .
+
+# Push to ECR
+aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 580655778303.dkr.ecr.ap-south-1.amazonaws.com
+docker tag citicore/config-server:1.0 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/config-server:1.0
+docker push 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/config-server:1.0
+
+# Create ECS task definition
+aws ecs register-task-definition --cli-input-json file://config-server-task-def.json
+
+# Create ECS service
+aws ecs create-service --cluster citicore-cluster --service-name config-server --task-definition config-server:1 --desired-count 1
+```
+
+**Step 3: Deploy Eureka Server**
+
+```bash
+# Build Docker image
+docker build -t citicore/eureka-server:1.0 .
+
+# Push to ECR
+docker tag citicore/eureka-server:1.0 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/eureka-server:1.0
+docker push 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/eureka-server:1.0
+
+# Create ECS task definition
+aws ecs register-task-definition --cli-input-json file://eureka-task-def.json
+
+# Create ECS service
+aws ecs create-service --cluster citicore-cluster --service-name eureka-server --task-definition eureka-server:1 --desired-count 1
+```
+
+**Step 4: Deploy Auth Service (and other services)**
+
+```bash
+# Same process as above - build, push, create task def, create service
+# Auth can now safely register with Eureka (already running)
+```
+
+### Interview Explanation
+
+"I implemented intentional deployment order because microservices have dependencies. If you deploy Auth Service before Eureka, it fails because it can't find the service registry. The correct order is: infrastructure first, then central services (Config Server, Eureka), then application services. This mirrors how we'd start a real office: you prepare the office first, then hire the manager, then hire employees. The employees (microservices) need the office (infrastructure) and manager (Eureka) to function."
+
+---
+
+## Amazon ECR (Elastic Container Registry)
+
+### Definition
+
+**Amazon Elastic Container Registry (ECR)** is AWS's managed Docker container image registry. It stores Docker images that can be pulled and run by ECS (container orchestration service).
+
+Think of it as a library for Docker images:
+
+```
+Local Docker Image
+        ↓
+Amazon ECR (Image Storage)
+        ↓
+ECS retrieves image
+        ↓
+Fargate runs container
+```
+
+### What You Implemented
+
+**ECR Setup for CitiCore:**
+
+```
+AWS Account: 580655778303
+Region: ap-south-1
+Repositories:
+
+1. citicore/config-server:1.0
+   URI: 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/config-server:1.0
+
+2. citicore/eureka-server:1.0
+   URI: 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/eureka-server:1.0
+
+3. citicore/auth-service:1.0
+   URI: 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/auth-service:1.0
+```
+
+### Why Use ECR
+
+**Problems it solves:**
+
+```
+Problem 1: Image Versioning
+├─ Without ECR: Images scattered on laptops
+├─ With ECR: Central registry, version control
+└─ Benefit: Reproducible deployments
+
+Problem 2: Image Distribution
+├─ Without ECR: Manual copying to AWS
+├─ With ECR: Pull from within AWS (faster, secure)
+└─ Benefit: Fast image pull, private registry
+
+Problem 3: Image Security
+├─ Without ECR: Images on Docker Hub (public)
+├─ With ECR: Private registry in your AWS account
+└─ Benefit: Only authorized users access images
+
+Problem 4: Integration with ECS
+├─ Without ECR: Configure credentials manually
+├─ With ECR: ECS assumes role, automatic access
+└─ Benefit: Seamless integration
+```
+
+### Step-by-Step Process
+
+**Step 1: Create ECR Repository**
+
+```bash
+# Create repository
+aws ecr create-repository \
+  --repository-name citicore/auth-service \
+  --region ap-south-1
+
+# Output:
+# {
+#   "repository": {
+#     "repositoryUri": "580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/auth-service"
+#   }
+# }
+```
+
+**Step 2: Authenticate Docker with ECR**
+
+```bash
+# Get authorization token
+aws ecr get-login-password --region ap-south-1
+
+# Login Docker CLI
+aws ecr get-login-password --region ap-south-1 | \
+  docker login --username AWS --password-stdin \
+  580655778303.dkr.ecr.ap-south-1.amazonaws.com
+
+# Output: Login Succeeded
+```
+
+**Step 3: Build Docker Image**
+
+```bash
+# Navigate to project directory
+cd ~/citicore-platform/auth-service
+
+# Build image
+docker build -t citicore/auth-service:1.0 .
+
+# Verify build
+docker images | grep auth-service
+# REPOSITORY                    TAG      IMAGE ID
+# citicore/auth-service         1.0      abc123def456
+```
+
+**Step 4: Tag Image for ECR**
+
+```bash
+# Tag image with ECR URI
+docker tag citicore/auth-service:1.0 \
+  580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/auth-service:1.0
+```
+
+**Step 5: Push to ECR**
+
+```bash
+# Push image to ECR
+docker push 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/auth-service:1.0
+
+# Output shows push progress:
+# Pushing [====>                                        ] 10%
+# Pushing [=========>                                   ] 20%
+# ...
+# Pushed image successfully
+```
+
+**Step 6: Verify Image in ECR**
+
+```bash
+# List images in repository
+aws ecr list-images \
+  --repository-name citicore/auth-service \
+  --region ap-south-1
+
+# Output:
+# {
+#   "imageIds": [
+#     {
+#       "imageTag": "1.0",
+#       "imageDigest": "sha256:abc123..."
+#     }
+#   ]
+# }
+
+# Get image details
+aws ecr describe-images \
+  --repository-name citicore/auth-service \
+  --image-ids imageTag=1.0 \
+  --region ap-south-1
+```
+
+### Interview Explanation
+
+"ECR is AWS's private container registry. Instead of storing Docker images locally or on public Docker Hub, I use ECR to store images within AWS. This provides security (private to our account), versioning (different versions of images), and integration with ECS (ECS can pull images directly). The workflow is: build image locally, authenticate with ECR, tag image with ECR URI, push to ECR, then ECS pulls from ECR when launching tasks. It's similar to GitHub for code, but for Docker images."
+
+---
+
+## Amazon ECS and Fargate
+
+### Definition
+
+**Amazon ECS (Elastic Container Service)** is AWS's managed container orchestration service. It runs and manages Docker containers at scale.
+
+**AWS Fargate** is the serverless compute engine used by ECS. Instead of managing EC2 instances yourself, Fargate handles the underlying infrastructure.
+
+```
+Traditional Approach:
+├─ Manage EC2 servers
+├─ Install Docker
+├─ Manage scaling
+└─ High operational overhead
+
+Fargate Approach:
+├─ Just deploy containers
+├─ Fargate manages servers
+├─ Auto-scaling available
+└─ Low operational overhead
+```
+
+### What You Implemented
+
+**ECS Cluster:**
+
+```
+citicore-cluster
+├─ Launch Type: Fargate (serverless)
+├─ Region: ap-south-1
+├─ Services running:
+│  ├─ config-server (CPU: 0.5, Memory: 1GB)
+│  ├─ eureka-server (CPU: 0.5, Memory: 1GB)
+│  └─ auth-service (CPU: 1, Memory: 3GB)
+└─ Total resources managed: Automatically by Fargate
+```
+
+### Why Use ECS with Fargate
+
+**Advantages:**
+
+```
+1. NO SERVER MANAGEMENT
+   ├─ You specify containers
+   ├─ AWS manages servers
+   └─ Focus on application, not infrastructure
+
+2. AUTOMATIC SCALING
+   ├─ Define desired task count
+   ├─ Add more tasks as needed
+   └─ Fargate handles capacity
+
+3. COST EFFICIENCY
+   ├─ Pay only for resources used
+   ├─ No idle server costs
+   └─ Better than managing EC2
+
+4. BUILT-IN MONITORING
+   ├─ CloudWatch integration
+   ├─ Health checks automatic
+   └─ Easy troubleshooting
+
+5. LOAD BALANCING
+   ├─ ALB integration built-in
+   ├─ Auto-distribution of traffic
+   └─ High availability
+```
+
+### Step-by-Step Process
+
+**Step 1: Create ECS Cluster**
+
+```bash
+# Create cluster (Fargate-compatible)
+aws ecs create-cluster \
+  --cluster-name citicore-cluster \
+  --capacity-providers FARGATE FARGATE_SPOT \
+  --region ap-south-1
+
+# Output:
+# {
+#   "cluster": {
+#     "clusterName": "citicore-cluster",
+#     "status": "ACTIVE"
+#   }
+# }
+```
+
+**Step 2: Create Task Definition**
+
+A task definition is a blueprint describing how containers should run.
+
+```bash
+# Create task definition file: task-definition.json
+cat > task-definition.json << 'EOF'
+{
+  "family": "citicore-auth-service",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "3072",
+  "executionRoleArn": "arn:aws:iam::580655778303:role/citicore-ecs-task-execution-role",
+  "taskRoleArn": "arn:aws:iam::580655778303:role/citicore-ecs-task-role",
+  "containerDefinitions": [
+    {
+      "name": "auth-service",
+      "image": "580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/auth-service:1.0",
+      "portMappings": [
+        {
+          "containerPort": 8081,
+          "hostPort": 8081,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true,
+      "environment": [
+        {
+          "name": "SPRING_CLOUD_CONFIG_URI",
+          "value": "http://config-server:8888"
+        },
+        {
+          "name": "EUREKA_CLIENT_SERVICEURL_DEFAULTZONE",
+          "value": "http://eureka-server-8761-tcp.citicore:8761/eureka"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/citicore-auth-service",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8081/actuator/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}
+EOF
+
+# Register task definition
+aws ecs register-task-definition \
+  --cli-input-json file://task-definition.json \
+  --region ap-south-1
+
+# Output shows task definition registered with revision number
+```
+
+**Step 3: Create ECS Service**
+
+```bash
+# Create service (maintains desired number of running tasks)
+aws ecs create-service \
+  --cluster citicore-cluster \
+  --service-name citicore-auth-service \
+  --task-definition citicore-auth-service:1 \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={
+    subnets=[subnet-private-a,subnet-private-b],
+    securityGroups=[sg-ecs-id],
+    assignPublicIp=DISABLED
+  }" \
+  --load-balancers targetGroupArn=arn:aws:elasticloadbalancing:...,containerName=auth-service,containerPort=8081 \
+  --region ap-south-1
+
+# Output shows service created
+```
+
+**Step 4: Verify Task is Running**
+
+```bash
+# List tasks in service
+aws ecs list-tasks \
+  --cluster citicore-cluster \
+  --service-name citicore-auth-service \
+  --region ap-south-1
+
+# Describe task status
+aws ecs describe-tasks \
+  --cluster citicore-cluster \
+  --tasks arn:aws:ecs:ap-south-1:580655778303:task/citicore-cluster/abc123 \
+  --region ap-south-1
+
+# Check status
+# lastStatus: RUNNING (wait for this)
+# desiredStatus: RUNNING
+# healthStatus: HEALTHY
+```
+
+**Step 5: Monitor Task Logs**
+
+```bash
+# View logs in CloudWatch
+aws logs tail /ecs/citicore-auth-service --follow --region ap-south-1
+
+# Or view in AWS Console
+# CloudWatch → Log Groups → /ecs/citicore-auth-service
+```
+
+### Interview Explanation
+
+"ECS with Fargate is the modern way to run containers on AWS. Instead of managing EC2 servers, I define how containers should run (CPU, memory, environment variables, ports), and Fargate handles the servers automatically. The workflow is: create task definition (blueprint for container), create service (tells ECS to run X tasks), and ECS/Fargate handles launching, monitoring, and replacing failed tasks. It's like telling a taxi service 'I need 5 taxis available' instead of buying taxis and managing drivers yourself."
+
+---
+
+## ECS Task Definition
+
+### Definition
+
+**ECS Task Definition** is a JSON blueprint that describes:
+- Which Docker image to use
+- How much CPU and memory to allocate
+- Environment variables and secrets
+- Port mappings
+- Logging configuration
+- Health checks
+- IAM roles
+
+Think of it as a detailed specification for how a container should run.
+
+### What You Implemented
+
+**Task Definition for Auth Service:**
+
+```json
+{
+  "family": "citicore-auth-service",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",           // 1 vCPU
+  "memory": "3072",        // 3 GB RAM
+  "containerDefinitions": [
+    {
+      "name": "auth-service",
+      "image": "580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/auth-service:1.0",
+      "portMappings": [
+        {
+          "containerPort": 8081,  // Container listens on 8081
+          "hostPort": 8081
+        }
+      ],
+      "environment": [
+        {
+          "name": "SPRING_CLOUD_CONFIG_URI",
+          "value": "http://config-server:8888"  // Config Server location
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/citicore-auth-service",
+          "awslogs-region": "ap-south-1"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8081/actuator/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "startPeriod": 60    // Give app 60 seconds to start
+      }
+    }
+  ]
+}
+```
+
+### Why This Approach
+
+**Key decisions explained:**
+
+```
+1. CPU: 1024 (1 vCPU)
+   ├─ Auth Service needs to hash passwords (CPU-intensive)
+   ├─ JWT generation requires CPU
+   ├─ 0.5 vCPU insufficient (was getting timeouts)
+   └─ 1 vCPU provides necessary compute power
+
+2. Memory: 3072 (3 GB)
+   ├─ Spring Boot base: ~300 MB
+   ├─ Spring Cloud: ~400 MB
+   ├─ JWT + Security libraries: ~200 MB
+   ├─ Database connections: ~200 MB
+   ├─ User session data: ~100 MB
+   ├─ Safety margin: ~1500 MB
+   └─ Total needed: ~3000 MB
+
+3. Health Check (startPeriod: 60)
+   ├─ Spring Boot takes ~30-60 seconds to start
+   ├─ Need to fetch config from Config Server
+   ├─ Need to register with Eureka
+   ├─ Short startPeriod causes task to be marked unhealthy
+   └─ 60 seconds gives enough time
+
+4. Network Mode: awsvpc
+   ├─ Required for Fargate
+   ├─ Each task gets its own ENI (network interface)
+   ├─ Task gets private IP in VPC
+   └─ Enables Service Connect DNS
+```
+
+### Step-by-Step Process
+
+**Step 1: Calculate Resource Requirements**
+
+```
+For Auth Service (banking, password hashing):
+├─ CPU: 1 vCPU (high CPU for crypto operations)
+├─ Memory: 3 GB (generous for JVM + dependencies)
+└─ Result: Well-resourced, no timeouts
+
+For Config Server (lightweight):
+├─ CPU: 0.5 vCPU (minimal)
+├─ Memory: 1 GB (just config serving)
+└─ Result: Cost-efficient
+```
+
+**Step 2: Define Environment Variables**
+
+```bash
+# Variables needed:
+SPRING_CLOUD_CONFIG_URI: http://config-server:8888
+EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://eureka-server:8761/eureka
+MYSQL_HOST: mysql.rds.amazonaws.com
+KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+
+# In task definition:
+"environment": [
+  {"name": "SPRING_CLOUD_CONFIG_URI", "value": "http://config-server:8888"},
+  {"name": "EUREKA_CLIENT_SERVICEURL_DEFAULTZONE", "value": "http://eureka-server:8761/eureka"}
+]
+
+# For secrets (passwords):
+"secrets": [
+  {"name": "DB_PASSWORD", "valueFrom": "arn:aws:secretsmanager:..."}
+]
+```
+
+**Step 3: Configure Port Mapping**
+
+```bash
+# Container port: 8081 (app listens on this)
+# Host port: 8081 (external traffic comes to this)
+# In Fargate, container port = host port
+
+"portMappings": [
+  {
+    "containerPort": 8081,
+    "hostPort": 8081,
+    "protocol": "tcp"
+  }
+]
+```
+
+**Step 4: Set Up Logging**
+
+```bash
+# Configure CloudWatch logging
+"logConfiguration": {
+  "logDriver": "awslogs",
+  "options": {
+    "awslogs-group": "/ecs/citicore-auth-service",
+    "awslogs-region": "ap-south-1",
+    "awslogs-stream-prefix": "ecs"
+  }
+}
+
+# Logs accessible via:
+aws logs tail /ecs/citicore-auth-service --follow
+```
+
+**Step 5: Configure Health Check**
+
+```bash
+# Health check tells ECS if task is healthy
+"healthCheck": {
+  "command": ["CMD-SHELL", "curl -f http://localhost:8081/actuator/health || exit 1"],
+  "interval": 30,           # Check every 30 seconds
+  "timeout": 5,             # Fail if takes >5 seconds
+  "retries": 3,             # Mark unhealthy after 3 failures
+  "startPeriod": 60         # CRITICAL: Wait 60s before starting checks
+}
+
+# Without startPeriod, task starts health checks immediately
+# App takes 30-60s to start
+# Health check fails before app is ready
+# Task marked unhealthy and replaced (infinite loop)
+```
+
+### Interview Explanation
+
+"Task Definition is like a recipe for how to run a container. It specifies: use this Docker image, allocate this much CPU/memory, pass these environment variables, run health checks this way, log to CloudWatch. The critical part is resource allocation—if I allocate too little CPU/memory, app becomes slow or crashes. And the health check startPeriod is crucial—give the app time to start before you start checking if it's healthy. Otherwise, you get an infinite cycle of tasks starting and immediately being killed for failing health checks."
+
+---
+
+## ECS Service
+
+### Definition
+
+**ECS Service** is an AWS resource that:
+- Maintains desired number of running tasks
+- Launches new tasks if one fails
+- Distributes load across tasks
+- Manages networking and security
+- Integrates with load balancers
+
+Think of it as a manager that ensures X tasks are always running and healthy.
+
+### What You Implemented
+
+```
+ECS Service: citicore-auth-service
+├─ Task Definition: citicore-auth-service:2
+├─ Desired Count: 1 (keep 1 task running)
+├─ Launch Type: FARGATE
+├─ Network: VPC subnets (private-a, private-b)
+├─ Security Group: citicore-ecs-sg
+├─ Load Balancer: auth-alb
+├─ Target Group: auth-service-tg
+└─ Health Check Status: Healthy
+```
+
+### Why Use ECS Service
+
+```
+Problem 1: Task Failure
+├─ Without Service: Task dies, nothing replaces it
+├─ With Service: Task dies, Service launches replacement
+└─ Benefit: High availability
+
+Problem 2: Scaling
+├─ Without Service: Manually launch tasks
+├─ With Service: Change desired-count, Service handles it
+└─ Benefit: Easy scaling
+
+Problem 3: Load Distribution
+├─ Without Service: Single task, no load sharing
+├─ With Service: Multiple tasks, load balanced
+└─ Benefit: Higher throughput
+
+Problem 4: Rolling Updates
+├─ Without Service: Stop old, start new (downtime)
+├─ With Service: Gradual task replacement (zero downtime)
+└─ Benefit: Deployment without downtime
+```
+
+### Step-by-Step Process
+
+**Step 1: Create VPC for Service**
+
+```bash
+# Service runs in VPC
+# Specify which subnets to use
+
+"networkConfiguration": {
+  "awsvpcConfiguration": {
+    "subnets": [
+      "subnet-private-a",  # Private subnet in AZ-a
+      "subnet-private-b"   # Private subnet in AZ-b
+    ],
+    "securityGroups": ["sg-ecs-id"],
+    "assignPublicIp": "DISABLED"  # No public IPs (use ALB)
+  }
+}
+```
+
+**Step 2: Create Load Balancer**
+
+```bash
+# Create ALB for external traffic
+aws elbv2 create-load-balancer \
+  --name auth-alb \
+  --subnets subnet-public-a subnet-public-b \
+  --security-groups sg-alb-id \
+  --scheme internet-facing \
+  --type application \
+  --region ap-south-1
+
+# Create target group (where ALB sends traffic)
+aws elbv2 create-target-group \
+  --name auth-service-tg \
+  --protocol HTTP \
+  --port 8081 \
+  --vpc-id vpc-id \
+  --target-type ip \
+  --health-check-path /actuator/health \
+  --health-check-interval-seconds 30 \
+  --region ap-south-1
+```
+
+**Step 3: Create ECS Service**
+
+```bash
+aws ecs create-service \
+  --cluster citicore-cluster \
+  --service-name citicore-auth-service \
+  --task-definition citicore-auth-service:2 \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={
+    subnets=[subnet-private-a,subnet-private-b],
+    securityGroups=[sg-ecs-id],
+    assignPublicIp=DISABLED
+  }" \
+  --load-balancers targetGroupArn=arn:aws:elasticloadbalancing:...,containerName=auth-service,containerPort=8081 \
+  --deployment-configuration maximumPercent=200,minimumHealthyPercent=100 \
+  --region ap-south-1
+```
+
+**Step 4: Verify Service is Running**
+
+```bash
+# Get service details
+aws ecs describe-services \
+  --cluster citicore-cluster \
+  --services citicore-auth-service \
+  --region ap-south-1
+
+# Check output:
+# status: ACTIVE
+# runningCount: 1
+# desiredCount: 1
+# deployments[0].status: PRIMARY
+```
+
+**Step 5: Check Task Health**
+
+```bash
+# List tasks
+aws ecs list-tasks \
+  --cluster citicore-cluster \
+  --service-name citicore-auth-service \
+  --region ap-south-1
+
+# Describe task
+aws ecs describe-tasks \
+  --cluster citicore-cluster \
+  --tasks arn:aws:ecs:... \
+  --region ap-south-1
+
+# Verify:
+# lastStatus: RUNNING
+# healthStatus: HEALTHY
+```
+
+### Interview Explanation
+
+"ECS Service is a manager for containers. I tell it: 'Keep 1 Auth Service task running at all times.' If the task crashes, Service automatically launches a replacement. If I want to scale up to 3 tasks, I change desired-count to 3, and Service launches 2 more. When deploying a new version, the Service does a rolling update: gradually replaces old tasks with new ones, so there's no downtime. It's like having a manager that ensures your restaurant always has 5 chefs on duty—if one gets sick, they hire another."
+
+---
+
+## VPC and Networking
+
+### Definition
+
+**VPC (Virtual Private Cloud)** is your own isolated network in AWS. Within it, you define:
+- IP address range (CIDR block)
+- Subnets (smaller divisions)
+- Internet access (Internet Gateway)
+- Routing rules
+- Security (Security Groups, Network ACLs)
+
+### What You Implemented
+
+```
+VPC: vpc-0d064f45265cbcdad
+CIDR: 10.0.0.0/16 (65,536 IP addresses available)
+
+Subnets:
+├─ Public-A: 10.0.1.0/24 (public, 254 IPs) - ALB here
+├─ Public-B: 10.0.2.0/24 (public, 254 IPs) - ALB backup
+├─ Private-A: 10.0.11.0/24 (private, 254 IPs) - Auth Service here
+├─ Private-B: 10.0.12.0/24 (private, 254 IPs) - Auth Service backup
+├─ DB-A: 10.0.21.0/24 (database only, 254 IPs) - RDS primary
+└─ DB-B: 10.0.22.0/24 (database only, 254 IPs) - RDS replica
+
+Security Groups:
+├─ ALB SG: Allows internet traffic on port 80/443
+├─ ECS SG: Allows ALB on port 8081, internal communication
+├─ RDS SG: Allows ECS on port 3306
+├─ Kafka SG: Allows ECS on port 9092
+└─ Redis SG: Allows ECS on port 6379
+```
+
+### Why This Architecture
+
+```
+1. PUBLIC SUBNETS FOR ALB
+   ├─ ALB needs internet access
+   ├─ Sends traffic to private ECS
+   └─ Benefit: Separation of concerns
+
+2. PRIVATE SUBNETS FOR APPLICATION
+   ├─ ECS tasks not directly accessible from internet
+   ├─ Must go through ALB
+   └─ Benefit: Security isolation
+
+3. DATABASE SUBNETS
+   ├─ RDS only in database subnets
+   ├─ Cannot be accessed from public
+   └─ Benefit: Database protection
+
+4. MULTIPLE AVAILABILITY ZONES
+   ├─ Subnet-A in ap-south-1a
+   ├─ Subnet-B in ap-south-1b
+   └─ Benefit: High availability (one AZ fails, other keeps running)
+```
+
+### Step-by-Step Process
+
+**Step 1: Create VPC**
+
+```bash
+aws ec2 create-vpc \
+  --cidr-block 10.0.0.0/16 \
+  --region ap-south-1
+
+# Output: vpc-0d064f45265cbcdad
+```
+
+**Step 2: Create Internet Gateway**
+
+```bash
+# Create IGW
+aws ec2 create-internet-gateway --region ap-south-1
+
+# Attach to VPC
+aws ec2 attach-internet-gateway \
+  --internet-gateway-id igw-id \
+  --vpc-id vpc-0d064f45265cbcdad \
+  --region ap-south-1
+```
+
+**Step 3: Create Subnets**
+
+```bash
+# Public subnet A
+aws ec2 create-subnet \
+  --vpc-id vpc-0d064f45265cbcdad \
+  --cidr-block 10.0.1.0/24 \
+  --availability-zone ap-south-1a \
+  --region ap-south-1
+
+# Public subnet B
+aws ec2 create-subnet \
+  --vpc-id vpc-0d064f45265cbcdad \
+  --cidr-block 10.0.2.0/24 \
+  --availability-zone ap-south-1b \
+  --region ap-south-1
+
+# Private subnet A
+aws ec2 create-subnet \
+  --vpc-id vpc-0d064f45265cbcdad \
+  --cidr-block 10.0.11.0/24 \
+  --availability-zone ap-south-1a \
+  --region ap-south-1
+
+# Private subnet B
+aws ec2 create-subnet \
+  --vpc-id vpc-0d064f45265cbcdad \
+  --cidr-block 10.0.12.0/24 \
+  --availability-zone ap-south-1b \
+  --region ap-south-1
+
+# DB subnet A
+aws ec2 create-subnet \
+  --vpc-id vpc-0d064f45265cbcdad \
+  --cidr-block 10.0.21.0/24 \
+  --availability-zone ap-south-1a \
+  --region ap-south-1
+
+# DB subnet B
+aws ec2 create-subnet \
+  --vpc-id vpc-0d064f45265cbcdad \
+  --cidr-block 10.0.22.0/24 \
+  --availability-zone ap-south-1b \
+  --region ap-south-1
+```
+
+**Step 4: Create Route Tables**
+
+```bash
+# Route table for public subnets
+aws ec2 create-route-table \
+  --vpc-id vpc-0d064f45265cbcdad \
+  --region ap-south-1
+
+# Add route to IGW (public internet access)
+aws ec2 create-route \
+  --route-table-id rt-public \
+  --destination-cidr-block 0.0.0.0/0 \
+  --gateway-id igw-id \
+  --region ap-south-1
+
+# Associate public subnets
+aws ec2 associate-route-table \
+  --subnet-id subnet-public-a \
+  --route-table-id rt-public \
+  --region ap-south-1
+
+# Route table for private subnets (no internet route)
+aws ec2 create-route-table \
+  --vpc-id vpc-0d064f45265cbcdad \
+  --region ap-south-1
+
+# Associate private subnets
+aws ec2 associate-route-table \
+  --subnet-id subnet-private-a \
+  --route-table-id rt-private \
+  --region ap-south-1
+```
+
+**Step 5: Create Security Groups**
+
+```bash
+# ALB Security Group
+aws ec2 create-security-group \
+  --group-name alb-sg \
+  --description "ALB security group" \
+  --vpc-id vpc-0d064f45265cbcdad \
+  --region ap-south-1
+
+# Allow HTTP from internet
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-alb \
+  --protocol tcp \
+  --port 80 \
+  --cidr 0.0.0.0/0 \
+  --region ap-south-1
+
+# ECS Security Group
+aws ec2 create-security-group \
+  --group-name ecs-sg \
+  --description "ECS security group" \
+  --vpc-id vpc-0d064f45265cbcdad \
+  --region ap-south-1
+
+# Allow ALB to reach ECS on port 8081
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-ecs \
+  --protocol tcp \
+  --port 8081 \
+  --source-group sg-alb \
+  --region ap-south-1
+```
+
+### Interview Explanation
+
+"VPC is your own isolated network on AWS. I designed it with public subnets for the load balancer (needs internet access), private subnets for application servers (protected from internet), and database subnets for RDS (even more protected). I spread subnets across two availability zones for high availability—if one data center fails, the other keeps running. Security groups act as firewalls: the ALB accepts traffic from the internet, but the ECS tasks only accept traffic from the ALB, and the database only accepts from the application servers. It's like a castle with outer walls (public), middle walls (private), and inner vault (database)."
+
+---
+
+## IAM Roles
+
+### Definition
+
+**IAM (Identity and Access Management)** roles define permissions for AWS services. There are two important roles for ECS:
+
+1. **Task Role**: Permissions for the application inside the container
+2. **Task Execution Role**: Permissions for ECS to manage the container
+
+### What You Implemented
+
+**Task Execution Role: citicore-ecs-task-execution-role**
+
+```
+Purpose: ECS infrastructure operations
+Allows:
+├─ ecr:GetDownloadUrlForLayer
+├─ ecr:BatchGetImage
+├─ ecr:GetAuthorizationToken
+├─ logs:CreateLogStream
+├─ logs:PutLogEvents
+└─ secretsmanager:GetSecretValue
+
+When ECS needs to:
+├─ Pull image from ECR
+├─ Write logs to CloudWatch
+└─ Retrieve secrets from Secrets Manager
+```
+
+**Task Role: citicore-ecs-task-role**
+
+```
+Purpose: Application operations within container
+Allows:
+├─ dynamodb:*          (if using DynamoDB)
+├─ s3:GetObject        (if using S3)
+├─ secretsmanager:GetSecretValue
+└─ cloudwatch:PutMetricData
+
+When application needs to:
+├─ Store data in DynamoDB
+├─ Access S3 buckets
+└─ Publish metrics to CloudWatch
+```
+
+### Why Separate Roles
+
+```
+Task Execution Role:
+├─ Used by ECS/Fargate itself
+├─ For infrastructure operations
+└─ Minimal permissions
+
+Task Role:
+├─ Used by application code
+├─ For business logic
+└─ More permissions needed
+
+Benefit: Least privilege principle
+├─ Application only has permissions it needs
+├─ If application compromised, limited damage
+└─ Security best practice
+```
+
+### Step-by-Step Process
+
+**Step 1: Create Task Execution Role**
+
+```bash
+# Create role
+aws iam create-role \
+  --role-name citicore-ecs-task-execution-role \
+  --assume-role-policy-document file://trust-policy.json
+
+# trust-policy.json:
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+
+# Attach policy for ECR access
+aws iam attach-role-policy \
+  --role-name citicore-ecs-task-execution-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+# Attach policy for CloudWatch logs
+aws iam attach-role-policy \
+  --role-name citicore-ecs-task-execution-role \
+  --policy-arn arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+# Attach policy for Secrets Manager
+aws iam attach-role-policy \
+  --role-name citicore-ecs-task-execution-role \
+  --policy-arn arn:aws:iam::aws:policy/SecretsManagerReadWrite
+```
+
+**Step 2: Create Task Role**
+
+```bash
+# Create role
+aws iam create-role \
+  --role-name citicore-ecs-task-role \
+  --assume-role-policy-document file://trust-policy.json
+
+# Create inline policy for application-specific permissions
+aws iam put-role-policy \
+  --role-name citicore-ecs-task-role \
+  --policy-name citicore-app-policy \
+  --policy-document file://app-policy.json
+
+# app-policy.json:
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": "arn:aws:secretsmanager:ap-south-1:580655778303:secret:citicore/*"
+    }
+  ]
+}
+```
+
+**Step 3: Use Roles in Task Definition**
+
+```bash
+# In task definition JSON:
+{
+  "executionRoleArn": "arn:aws:iam::580655778303:role/citicore-ecs-task-execution-role",
+  "taskRoleArn": "arn:aws:iam::580655778303:role/citicore-ecs-task-role"
+}
+```
+
+### Interview Explanation
+
+"IAM roles control what permissions tasks have. The execution role is for ECS to pull images from ECR and write logs to CloudWatch—infrastructure stuff. The task role is for the application code inside the container to access AWS services like Secrets Manager. They're separate because the application shouldn't have permissions it doesn't need. If the application is compromised, the attacker only gets the permissions granted to the task role, which is limited. It's the principle of least privilege: each service gets only the permissions it requires."
+
+---
+
+## Spring Cloud Config Server
+
+### Definition
+
+**Spring Cloud Config Server** is a centralized configuration management service. Instead of embedding configuration in code or environment variables, services fetch configuration from a central server at startup.
+
+```
+Without Config Server:
+├─ Config in application.yml (in code)
+├─ Config in environment variables
+└─ Hard to update without redeployment
+
+With Config Server:
+├─ Config in Git repository
+├─ Services fetch at startup
+├─ Change without redeployment (Spring Cloud Bus)
+└─ Single source of truth
+```
+
+### What You Implemented
+
+```
+Config Server: citicore-config-repo
+├─ Repository: Rabbaniinamdar/citicore-config-repo (GitHub)
+├─ Port: 8888
+├─ Files:
+│  ├─ application.yml (shared config)
+│  ├─ auth-service.yml
+│  ├─ account-service.yml
+│  ├─ user-service.yml
+│  ├─ transaction-service.yml
+│  ├─ notification-service.yml
+│  └─ apigateway-service.yml
+└─ Benefits:
+   ├─ Version control for configurations
+   ├─ Easy rollback of config changes
+   └─ Track who changed what
+```
+
+### Why Use Config Server
+
+```
+Problem 1: Configuration Duplication
+├─ Without: Each service has its own copy of shared config
+├─ With: Shared config in one place
+└─ Benefit: DRY principle (Don't Repeat Yourself)
+
+Problem 2: Configuration Changes
+├─ Without: Recompile, rebuild Docker image, redeploy
+├─ With: Change in Git, server fetches new config
+└─ Benefit: Fast updates, no redeployment
+
+Problem 3: Configuration Consistency
+├─ Without: Easy to have config drift between services
+├─ With: All services use same source
+└─ Benefit: Consistency, fewer surprises
+
+Problem 4: Multiple Environments
+├─ Without: Hard to manage dev/staging/prod configs
+├─ With: Different branches or files per environment
+└─ Benefit: Environment-specific configurations
+```
+
+### Step-by-Step Process
+
+**Step 1: Create GitHub Configuration Repository**
+
+```bash
+# Create repo: citicore-config-repo
+
+# Structure:
+citicore-config-repo/
+├─ application.yml          # Shared config
+├─ auth-service.yml
+├─ account-service.yml
+└─ ...
+
+# application.yml (shared):
+spring:
+  kafka:
+    bootstrap-servers: kafka:9092
+  
+eureka:
+  client:
+    service-url:
+      defaultZone: http://eureka-server:8761/eureka
+
+# auth-service.yml (auth-specific):
+spring:
+  datasource:
+    url: jdbc:mysql://mysql:3306/auth_db
+    username: app_user
+    password: ${DB_PASSWORD}
+  
+server:
+  port: 8081
+```
+
+**Step 2: Configure Config Server Application**
+
+```bash
+# application.yml for Config Server itself:
+spring:
+  application:
+    name: config-server
+  cloud:
+    config:
+      server:
+        git:
+          uri: https://github.com/Rabbaniinamdar/citicore-config-repo
+          clone-on-start: true
+          default-label: main
+          username: ${GITHUB_USER}
+          password: ${GITHUB_TOKEN}
+
+server:
+  port: 8888
+```
+
+**Step 3: Start Config Server**
+
+```bash
+# Build Docker image
+docker build -t citicore/config-server:1.0 .
+
+# Push to ECR
+docker push 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/config-server:1.0
+
+# Deploy to ECS
+aws ecs update-service \
+  --cluster citicore-cluster \
+  --service config-server \
+  --task-definition config-server:1 \
+  --force-new-deployment
+```
+
+**Step 4: Configure Service to Use Config Server**
+
+```bash
+# Create bootstrap.yml in Auth Service:
+spring:
+  application:
+    name: auth-service
+  cloud:
+    config:
+      uri: http://config-server:8888
+      fail-fast: true
+
+# Auth Service fetches config on startup from Config Server
+```
+
+**Step 5: Verify Configuration**
+
+```bash
+# Config Server provides endpoints:
+curl http://config-server:8888/auth-service/default
+# Returns: auth-service configuration
+
+curl http://config-server:8888/account-service/default
+# Returns: account-service configuration
+
+curl http://config-server:8888/application/default
+# Returns: shared configuration
+```
+
+### Interview Explanation
+
+"Config Server centralizes configuration management. Instead of baking configuration into Docker images or using environment variables, services fetch their configuration from a Git-backed server at startup. This provides several benefits: version control for configurations (track changes, rollback), single source of truth (no config drift), and fast updates (change Git, service picks it up without redeployment). For microservices running 10+ instances, this beats managing individual configs per instance. Combined with Spring Cloud Bus, you can broadcast configuration changes to all services instantly."
+
+---
+
+## Eureka Service Discovery
+
+### Definition
+
+**Eureka** is a service discovery tool that maintains a registry of microservice instances. Instead of hardcoding IP addresses, services register with Eureka and discover each other dynamically.
+
+```
+Without Eureka (hardcoded):
+├─ Account Service at 10.0.1.50:8081
+├─ User Service at 10.0.1.51:8082
+└─ If 10.0.1.50 crashes, everything breaks
+
+With Eureka (dynamic):
+├─ Account Service registers: "I'm at 10.0.1.50:8081"
+├─ Account Service crashes, replaced at 10.0.1.60:8081
+├─ Eureka updated automatically
+└─ User Service discovers new address automatically
+```
+
+### What You Implemented
+
+```
+Eureka Server:
+├─ Service: citicore-eureka-server
+├─ Port: 8761
+├─ Task Definition: citicore-eureka-server:1
+├─ Running: 1 task
+└─ Status: HEALTHY
+
+Configuration:
+eureka:
+  client:
+    register-with-eureka: false  (Eureka doesn't register itself)
+    fetch-registry: false         (Single Eureka, no clustering)
+  server:
+    enable-self-preservation: false
+
+Registered Services:
+├─ auth-service (http://eureka-server-8761-tcp.citicore:8761/eureka)
+├─ account-service
+├─ user-service
+└─ ... (others as deployed)
+```
+
+### Why Use Eureka
+
+```
+Problem 1: Hardcoded IP Addresses
+├─ ECS Fargate replaces tasks, IP changes
+├─ Hardcoded addresses break
+└─ Solution: Dynamic discovery
+
+Problem 2: Load Balancing
+├─ Multiple instances of same service
+├─ Need to distribute requests
+└─ Eureka provides list of healthy instances
+
+Problem 3: Failure Detection
+├─ Task crashes or becomes unhealthy
+├─ Must be removed from rotation
+└─ Eureka health checks detect failures
+
+Problem 4: Scaling
+├─ Add more instances automatically
+├─ Other services automatically discover them
+└─ No configuration changes needed
+```
+
+### Step-by-Step Process
+
+**Step 1: Build Eureka Server**
+
+```bash
+# pom.xml dependencies:
+<dependency>
+  <groupId>org.springframework.cloud</groupId>
+  <artifactId>spring-cloud-starter-netflix-eureka-server</artifactId>
+</dependency>
+
+# Main class:
+@SpringBootApplication
+@EnableEurekaServer
+public class EurekaServerApplication {
+  public static void main(String[] args) {
+    SpringApplication.run(EurekaServerApplication.class, args);
+  }
+}
+
+# application.yml:
+spring:
+  application:
+    name: eureka-server
+server:
+  port: 8761
+eureka:
+  client:
+    register-with-eureka: false
+    fetch-registry: false
+```
+
+**Step 2: Build Docker Image**
+
+```bash
+# Dockerfile:
+FROM eclipse-temurin:17-jre
+WORKDIR /app
+COPY target/eureka-server-0.0.1-SNAPSHOT.jar app.jar
+EXPOSE 8761
+ENTRYPOINT ["java", "-jar", "app.jar"]
+
+# Build:
+docker build -t citicore/eureka-server:1.0 .
+
+# Test locally:
+docker run -d -p 8761:8761 citicore/eureka-server:1.0
+# Visit: http://localhost:8761/
+```
+
+**Step 3: Deploy to ECS**
+
+```bash
+# Push to ECR
+docker push 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/eureka-server:1.0
+
+# Create task definition
+aws ecs register-task-definition --cli-input-json file://eureka-task-def.json
+
+# Create service
+aws ecs create-service \
+  --cluster citicore-cluster \
+  --service-name citicore-eureka-server \
+  --task-definition citicore-eureka-server:1 \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[...],securityGroups=[...]}"
+```
+
+**Step 4: Configure Services to Register with Eureka**
+
+```bash
+# Auth Service bootstrap.yml:
+eureka:
+  client:
+    register-with-eureka: true  (Register this service)
+    fetch-registry: true        (Discover other services)
+    service-url:
+      defaultZone: http://eureka-server-8761-tcp.citicore:8761/eureka
+  instance:
+    hostname: auth-service
+    lease-renewal-interval-in-seconds: 10  (Send heartbeat every 10s)
+
+# Account Service bootstrap.yml: (same pattern)
+eureka:
+  client:
+    register-with-eureka: true
+    fetch-registry: true
+    service-url:
+      defaultZone: http://eureka-server-8761-tcp.citicore:8761/eureka
+```
+
+**Step 5: Verify Services Are Registered**
+
+```bash
+# Check Eureka dashboard
+curl http://eureka-server:8761/
+
+# Get registered apps
+curl http://eureka-server:8761/eureka/apps
+
+# Output shows:
+{
+  "applications": {
+    "application": [
+      {
+        "name": "AUTH-SERVICE",
+        "instance": [
+          {
+            "instanceId": "auth-service",
+            "hostName": "10.0.11.50",
+            "port": 8081,
+            "status": "UP"
+          }
+        ]
+      }
+    ]
+  }
+}
+
+# Get specific service
+curl http://eureka-server:8761/eureka/apps/AUTH-SERVICE
+```
+
+### Interview Explanation
+
+"Eureka solves the problem of dynamic discovery in microservices. When a container starts in Fargate, it gets a private IP address. Instead of hardcoding that address, the service registers with Eureka: 'I'm Auth Service at 10.0.11.50:8081.' Other services query Eureka: 'Where is Auth Service?' and get the current address. If a task crashes and restarts at a different IP, Eureka updates automatically. It's like a phone directory: instead of remembering phone numbers, you call the directory, ask 'What's Bob's number?', and get the current number. If Bob moves and gets a new number, he updates the directory, and everyone automatically calls the new number."
+
+---
+
+## ECS Service Connect
+
+### Definition
+
+**ECS Service Connect** is AWS's feature for service-to-service networking within ECS. It provides:
+- DNS-based service discovery
+- Built-in load balancing
+- Network isolation
+- No need for external service mesh
+
+```
+Without Service Connect:
+├─ Services use IP addresses directly
+├─ Hard to manage, not flexible
+└─ Services tightly coupled
+
+With Service Connect:
+├─ Services use DNS names
+├─ Automatic load balancing
+├─ Namespace isolation
+└─ Easy scaling
+```
+
+### What You Implemented
+
+```
+Service Connect Namespace: citicore
+
+Eureka Server Discovery Name:
+├─ Name: eureka-server-8761-tcp
+├─ DNS: eureka-server-8761-tcp.citicore:8761
+└─ Used by Auth Service to reach Eureka
+
+Auth Service Discovery Name:
+├─ Name: auth-service-8081-tcp
+├─ DNS: auth-service-8081-tcp.citicore:8081
+└─ Used by other services to reach Auth
+
+Configuration:
+├─ Namespace: citicore (shared namespace)
+├─ Network Mode: awsvpc (required for Service Connect)
+└─ Services can discover each other via DNS
+```
+
+### Why Use Service Connect
+
+```
+Problem 1: Service-to-Service Communication
+├─ Without Service Connect: Hard to reach other services
+├─ With Service Connect: Use DNS names
+└─ Benefit: Decoupling from IP addresses
+
+Problem 2: Multiple Instances
+├─ Without: Need to manually load balance
+├─ With: Automatic load balancing across instances
+└─ Benefit: High availability
+
+Problem 3: Network Flexibility
+├─ Without: Need API Gateway or Service Mesh
+├─ With: Built into ECS
+└─ Benefit: Simplicity, no additional tools
+```
+
+### Step-by-Step Process
+
+**Step 1: Enable Service Connect on Service**
+
+```bash
+# Create service with Service Connect
+aws ecs create-service \
+  --cluster citicore-cluster \
+  --service-name citicore-eureka-server \
+  --task-definition citicore-eureka-server:1 \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --service-connect-configuration '{
+    "enabled": true,
+    "namespace": "citicore",
+    "services": [
+      {
+        "portName": "tcp",
+        "discoveryName": "eureka-server-8761-tcp",
+        "clientAliases": [
+          {
+            "port": 8761,
+            "dnsName": "eureka-server-8761-tcp.citicore"
+          }
+        ]
+      }
+    ]
+  }'
+
+# Or update existing service
+aws ecs update-service \
+  --cluster citicore-cluster \
+  --service citicore-eureka-server \
+  --service-connect-configuration '{
+    "enabled": true,
+    "namespace": "citicore",
+    ...
+  }'
+```
+
+**Step 2: Configure Services to Use Service Connect DNS**
+
+```bash
+# Auth Service bootstrap.yml:
+eureka:
+  client:
+    register-with-eureka: true
+    fetch-registry: true
+    service-url:
+      defaultZone: http://eureka-server-8761-tcp.citicore:8761/eureka
+      # Uses Service Connect DNS name instead of IP
+  instance:
+    prefer-ip-address: false  # Use hostname, not IP
+```
+
+**Step 3: Verify Service Connect**
+
+```bash
+# From inside Auth Service container:
+curl http://eureka-server-8761-tcp.citicore:8761/
+
+# If working:
+# Response: Eureka Server page
+
+# If not working (UnknownHostException):
+# Need to verify:
+# 1. Service Connect enabled on both services
+# 2. Namespace names match
+# 3. Discovery names correct
+# 4. Network mode is awsvpc
+```
+
+**Step 4: Handle DNS Issues (UnknownHostException)**
+
+```
+Problem: UnknownHostException: eureka-server-8761-tcp.citicore
+
+Root Causes:
+├─ Service Connect not enabled on Eureka
+├─ Discovery name misspelled
+├─ Namespace name doesn't match
+├─ Network mode not awsvpc
+└─ Service not in same namespace
+
+Solution:
+1. Check Eureka service has Service Connect enabled
+   aws ecs describe-services --cluster citicore-cluster --services citicore-eureka-server
+   
+2. Verify namespace matches
+   Both services should have: "namespace": "citicore"
+   
+3. Check discovery name in Auth config
+   Should match Eureka's discoveryName: "eureka-server-8761-tcp"
+   
+4. Verify network mode
+   Task definition should have: "networkMode": "awsvpc"
+   
+5. Check logs in CloudWatch
+   aws logs tail /ecs/citicore-auth-service --follow
+   Look for: "failed to resolve eureka-server-8761-tcp.citicore"
+```
+
+### Interview Explanation
+
+"Service Connect is ECS's built-in networking for service-to-service communication. Instead of services hardcoding IP addresses of other services, they use DNS names through Service Connect. Auth Service doesn't need to know Eureka's IP; it just asks: 'Where is eureka-server-8761-tcp.citicore?' and Service Connect responds with the current IP. If Eureka task crashes and restarts at a different IP, Service Connect updates automatically. It's simpler than a service mesh, no external components needed—just configure the namespace and discovery names, and ECS handles routing."
+
+---
+
+## Application Load Balancer (ALB)
+
+### Definition
+
+**Application Load Balancer (ALB)** distributes incoming traffic across multiple targets (ECS tasks). It's layer 7 aware (understands HTTP, hostnames, paths).
+
+```
+Without ALB:
+├─ Clients connect directly to tasks
+├─ If task crashes, connection lost
+├─ No load balancing
+└─ Client gets specific IP
+
+With ALB:
+├─ Clients connect to ALB (single entry point)
+├─ ALB distributes to healthy tasks
+├─ If task crashes, traffic automatically diverted
+└─ Automatic failover
+```
+
+### What You Implemented
+
+```
+Auth ALB:
+├─ Name: auth-alb
+├─ Port: 80 (HTTP) → routes to port 8081
+├─ Subnets: Public subnets (public-a, public-b)
+├─ Security Group: alb-sg
+├─ Target Group: auth-service-tg
+├─ Targets: Auth Service ECS tasks
+├─ Health Check: /actuator/health
+└─ Status: Active, all targets healthy
+
+Routing:
+Internet:80
+   ↓
+ALB:80
+   ↓
+Target Group
+   ↓
+Auth Service Task 1: 10.0.11.50:8081
+Auth Service Task 2: 10.0.11.51:8081
+Auth Service Task 3: 10.0.11.52:8081
+   ↓
+Distributed across all healthy tasks
+```
+
+### Why Use ALB
+
+```
+Problem 1: Single Point of Failure
+├─ Without: If Auth Service task crashes, service down
+├─ With: Other tasks take traffic
+└─ Benefit: High availability
+
+Problem 2: Load Distribution
+├─ Without: All traffic to one task
+├─ With: Traffic distributed across tasks
+└─ Benefit: Better performance
+
+Problem 3: Scaling
+├─ Without: Hard to add new tasks
+├─ With: New tasks automatically added to ALB
+└─ Benefit: Easy horizontal scaling
+
+Problem 4: Failure Recovery
+├─ Without: Manual intervention to failover
+├─ With: Automatic detection and rerouting
+└─ Benefit: Self-healing infrastructure
+```
+
+### Step-by-Step Process
+
+**Step 1: Create ALB**
+
+```bash
+# Create load balancer
+aws elbv2 create-load-balancer \
+  --name auth-alb \
+  --subnets subnet-public-a subnet-public-b \
+  --security-groups sg-alb-id \
+  --scheme internet-facing \
+  --type application \
+  --region ap-south-1
+
+# Output:
+# {
+#   "LoadBalancers": [
+#     {
+#       "LoadBalancerArn": "arn:aws:elasticloadbalancing:...",
+#       "DNSName": "auth-alb-123456789.ap-south-1.elb.amazonaws.com"
+#     }
+#   ]
+# }
+```
+
+**Step 2: Create Target Group**
+
+```bash
+# Target group is where ALB sends traffic
+aws elbv2 create-target-group \
+  --name auth-service-tg \
+  --protocol HTTP \
+  --port 8081 \
+  --vpc-id vpc-id \
+  --target-type ip \
+  --health-check-enabled \
+  --health-check-path /actuator/health \
+  --health-check-protocol HTTP \
+  --health-check-port 8081 \
+  --health-check-interval-seconds 30 \
+  --health-check-timeout-seconds 5 \
+  --healthy-threshold-count 2 \
+  --unhealthy-threshold-count 3 \
+  --region ap-south-1
+
+# Output:
+# {
+#   "TargetGroups": [
+#     {
+#       "TargetGroupArn": "arn:aws:elasticloadbalancing:...",
+#       "TargetGroupName": "auth-service-tg"
+#     }
+#   ]
+# }
+```
+
+**Step 3: Create ALB Listener**
+
+```bash
+# Listener tells ALB what to do with incoming traffic
+aws elbv2 create-listener \
+  --load-balancer-arn arn:aws:elasticloadbalancing:... \
+  --protocol HTTP \
+  --port 80 \
+  --default-actions Type=forward,TargetGroupArn=arn:... \
+  --region ap-south-1
+
+# Listener configuration:
+# HTTP:80 → Forward to target group (auth-service-tg)
+# Port 8081 is where the tasks listen
+```
+
+**Step 4: Verify Target Health**
+
+```bash
+# Check target health
+aws elbv2 describe-target-health \
+  --target-group-arn arn:aws:elasticloadbalancing:... \
+  --region ap-south-1
+
+# Output:
+# {
+#   "TargetHealthDescriptions": [
+#     {
+#       "Target": {
+#         "Id": "10.0.11.50",
+#         "Port": 8081
+#       },
+#       "TargetHealth": {
+#         "State": "healthy",
+#         "Reason": "N/A"
+#       }
+#     }
+#   ]
+# }
+
+# If unhealthy:
+# Check:
+# 1. Task running
+# 2. Security group allows ALB
+# 3. /actuator/health endpoint working
+# 4. App has started (check startPeriod)
+```
+
+**Step 5: Connect ECS Service to ALB**
+
+```bash
+# When creating ECS service, specify target group
+aws ecs create-service \
+  --cluster citicore-cluster \
+  --service-name citicore-auth-service \
+  --task-definition citicore-auth-service:1 \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --load-balancers targetGroupArn=arn:...,containerName=auth-service,containerPort=8081 \
+  --region ap-south-1
+
+# This tells ECS to:
+# 1. Launch Auth Service tasks
+# 2. Register them with ALB target group
+# 3. ALB automatically routes traffic to healthy tasks
+```
+
+**Step 6: Test ALB**
+
+```bash
+# Get ALB DNS name
+aws elbv2 describe-load-balancers \
+  --names auth-alb \
+  --region ap-south-1
+
+# Test endpoint
+curl http://auth-alb-123456789.ap-south-1.elb.amazonaws.com/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"Pass@123"}'
+
+# If working:
+# Response: 201 Created (or appropriate response)
+
+# If not working:
+# Check:
+# 1. ALB status (Active)
+# 2. Target health (Healthy)
+# 3. Security group rules
+# 4. CloudWatch logs
+```
+
+### Interview Explanation
+
+"ALB is the gateway between the internet and our services. Instead of clients connecting directly to specific task IPs (which change constantly in Fargate), they connect to the ALB DNS name, which is stable. The ALB has a target group that knows about all Auth Service tasks. When a request comes in, ALB checks which targets are healthy and routes to one of them. If a task crashes, the ALB detects it's unhealthy and stops sending traffic there. New traffic goes to remaining healthy tasks. When we scale up (add more tasks), they're automatically added to the target group and receive traffic. It's the load-balancing glue that holds everything together."
+
+---
+
+## Real Issues & Troubleshooting
+
+### Issue #1: 504 Gateway Timeout on Registration
+
+**Problem:**
+
+```
+POST /api/v1/auth/register
+Status: 504 Gateway Timeout
+Response: "upstream request timeout"
+Duration: 16+ seconds before timing out
+```
+
+**Root Cause Analysis:**
+
+The troubleshooting process went through multiple layers:
+
+```
+Layer 1: ECS Task Status
+├─ ✅ Task is RUNNING
+└─ Task health checks passing
+
+Layer 2: ALB Target Health
+├─ ✅ Target shows HEALTHY
+└─ No connection issues to task
+
+Layer 3: ALB Health Endpoint
+├─ ✅ /actuator/health returns 200 OK
+└─ Application responding to health checks
+
+Layer 4: Application Logic
+├─ ✅ User saved to database
+├─ ✅ OTP generated
+├─ ✅ Response prepared
+└─ ⚠️ BUT: Timeout still occurring
+
+Layer 5: Kafka Producer
+├─ ❌ Publishing OTP event to Kafka
+├─ ❌ Topic 'otp-topic' does not exist
+└─ HANGING waiting for response
+
+Root Cause Found: Kafka topic missing
+```
+
+**The Issue:**
+
+```
+Auth Service Registration Flow:
+1. Validate input
+2. Hash password
+3. Save user to database
+4. Generate OTP
+5. Publish VerificationOtpEvent to Kafka → HANGS HERE
+6. Return response
+
+Kafka Issue:
+├─ Topic 'otp-topic' not created
+├─ Kafka tries to create it
+├─ Broker config says: don't auto-create
+├─ Kafka hangs waiting
+├─ ALB timeout after 30 seconds
+├─ Returns 504 to client
+└─ User still saved in database!
+
+Important: 504 doesn't mean operation failed
+├─ User WAS saved
+├─ OTP WAS generated
+├─ But client got timeout
+└─ Could be duplicate user on retry
+```
+
+**Solution:**
+
+```bash
+# Step 1: Verify Kafka is running
+docker exec kafka bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092
+
+# Step 2: Check existing topics
+docker exec kafka bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+
+# Step 3: Create missing otp-topic
+docker exec kafka bin/kafka-topics.sh \
+  --create \
+  --topic otp-topic \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 \
+  --replication-factor 1
+
+# Step 4: Verify topic created
+docker exec kafka bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+
+# Step 5: Test producer
+docker exec kafka bin/kafka-console-consumer.sh \
+  --topic otp-topic \
+  --bootstrap-server localhost:9092 \
+  --from-beginning
+
+# Step 6: Retry registration
+curl -X POST http://auth-alb/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"Pass@123"}'
+
+# Result: Now completes successfully (or different error if other issues)
+```
+
+**Key Lesson:**
+
+```
+504 Gateway Timeout does NOT mean:
+├─ Request failed
+├─ Data not saved
+├─ Operation incomplete
+└─ Everything is bad
+
+504 means:
+├─ ALB didn't get response within timeout period
+├─ Could be hanging on external service (Kafka, DB, etc.)
+├─ Check application logs
+├─ Data might be partially saved
+└─ Retry might cause issues (duplicates)
+```
+
+### Issue #2: UnknownHostException for Eureka Service Connect DNS
+
+**Problem:**
+
+```
+CloudWatch logs show:
+UnknownHostException: eureka-server-8761-tcp.citicore
+```
+
+**Root Cause:**
+
+```
+Auth Service tries to register with Eureka:
+├─ Configuration: eureka.client.service-url.defaultZone=http://eureka-server-8761-tcp.citicore:8761/eureka
+├─ Auth Service tries to resolve DNS
+├─ Java DNS resolver can't find eureka-server-8761-tcp.citicore
+├─ Throws UnknownHostException
+└─ Service fails to register
+
+Why?
+├─ Service Connect not enabled on Eureka
+├─ Or discovery name is different
+├─ Or namespace is different
+└─ Or Service Connect DNS not propagated yet
+```
+
+**Solution:**
+
+```bash
+# Step 1: Verify Eureka has Service Connect enabled
+aws ecs describe-services \
+  --cluster citicore-cluster \
+  --services citicore-eureka-server \
+  --region ap-south-1 | jq '.services[0].serviceConnectConfiguration'
+
+# Should show:
+# {
+#   "enabled": true,
+#   "namespace": "citicore",
+#   "services": [
+#     {
+#       "discoveryName": "eureka-server-8761-tcp"
+#     }
+#   ]
+# }
+
+# Step 2: If Service Connect not enabled, update it
+aws ecs update-service \
+  --cluster citicore-cluster \
+  --service citicore-eureka-server \
+  --service-connect-configuration '{
+    "enabled": true,
+    "namespace": "citicore",
+    "services": [
+      {
+        "portName": "tcp",
+        "discoveryName": "eureka-server-8761-tcp",
+        "clientAliases": [
+          {
+            "port": 8761,
+            "dnsName": "eureka-server-8761-tcp.citicore"
+          }
+        ]
+      }
+    ]
+  }' \
+  --force-new-deployment
+
+# Step 3: Wait for Eureka to redeploy
+aws ecs wait services-stable \
+  --cluster citicore-cluster \
+  --services citicore-eureka-server
+
+# Step 4: Check Auth Service configuration matches
+# bootstrap.yml should have:
+# eureka:
+#   client:
+#     service-url:
+#       defaultZone: http://eureka-server-8761-tcp.citicore:8761/eureka
+
+# Step 5: Restart Auth Service
+aws ecs update-service \
+  --cluster citicore-cluster \
+  --service citicore-auth-service \
+  --force-new-deployment
+
+# Step 6: Monitor logs
+aws logs tail /ecs/citicore-auth-service --follow
+
+# Should see: "Started AuthServiceApplication" (without UnknownHostException)
+```
+
+### Issue #3: Kafka UNKNOWN_TOPIC_OR_PARTITION Error
+
+**Problem:**
+
+```
+CloudWatch logs:
+org.apache.kafka.common.errors.UnknownTopicOrPartitionException: Topic 'otp-topic' not found
+```
+
+**Root Cause:**
+
+```
+Kafka broker configuration:
+├─ auto.create.topics.enable = false
+├─ Topics must be created manually
+├─ Application tries to produce to non-existent topic
+└─ Kafka rejects the message
+```
+
+**Solution:**
+
+```bash
+# Same as 504 troubleshooting, create the topic:
+docker exec kafka bin/kafka-topics.sh \
+  --create \
+  --topic otp-topic \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 \
+  --replication-factor 1
+
+# Verify:
+docker exec kafka bin/kafka-topics.sh --list --bootstrap-server localhost:9092 | grep otp-topic
+```
+
+### Troubleshooting Process (General Pattern)
+
+```
+When something fails:
+
+1. CHECK ECS TASK
+   ├─ Task running?
+   ├─ Task healthy?
+   └─ CloudWatch logs
+   
+2. CHECK ALB
+   ├─ ALB active?
+   ├─ Target healthy?
+   ├─ Test health endpoint
+   └─ Check target group
+   
+3. CHECK APPLICATION LOGS
+   ├─ What error message?
+   ├─ Stack trace?
+   └─ When did it start?
+   
+4. CHECK DEPENDENCIES
+   ├─ Config Server reachable?
+   ├─ Eureka reachable?
+   ├─ Database reachable?
+   ├─ Kafka reachable?
+   └─ Redis reachable?
+   
+5. CHECK CONFIGURATION
+   ├─ URLs correct?
+   ├─ Credentials correct?
+   ├─ Environment variables set?
+   └─ Secrets accessible?
+   
+6. VERIFY DATA
+   ├─ Was the operation actually completed?
+   ├─ Check database for data
+   ├─ Check Kafka for messages
+   └─ Don't assume failure from timeout
+   
+7. NARROW DOWN LAYER
+   ├─ Network issue (security groups)?
+   ├─ DNS issue (Service Connect)?
+   ├─ Application issue (code bug)?
+   ├─ Configuration issue (wrong URL)?
+   └─ External dependency (Kafka not responding)?
+```
+
+---
+
+## Kafka Event Streaming
+
+### Definition
+
+**Kafka** is a distributed event streaming platform. It decouples services by using publish-subscribe messaging instead of direct service calls.
+
+```
+Direct Call (Tight Coupling):
+Auth Service → Call Notification Service → Send Email
+Problem: If Notification Service down, Auth fails
+
+Kafka (Loose Coupling):
+Auth Service → Publish to Kafka → Notification Service reads
+Benefit: If Notification Service down, Kafka queues events
+```
+
+### What You Implemented
+
+**Kafka on EC2:**
+
+```
+Kafka Broker:
+├─ Server: citicore-infra (EC2 t3.small)
+├─ Port: 9092
+├─ Docker Container: apache/kafka:4.0.1
+├─ Mode: KRaft (no ZooKeeper)
+└─ Bootstrap Servers: 10.0.1.87:9092
+
+Topics:
+├─ otp-topic: OTP verification events
+├─ auth-events: Authentication events
+├─ account-events: Account events
+└─ ... (others as needed)
+
+Producer (Auth Service):
+├─ Publishes VerificationOtpEvent to otp-topic
+├─ Event contains: email, otp, timestamp
+└─ Notification Service consumes
+
+Consumer (Notification Service - Not Yet Deployed):
+├─ Reads from otp-topic
+├─ Sends OTP via email
+└─ Marks event processed
+```
+
+### Why Use Kafka
+
+```
+Problem 1: Synchronous Dependencies
+├─ Auth calls Notification directly
+├─ If Notification slow/down, Auth affected
+└─ Solution: Async via Kafka
+
+Problem 2: Event Loss
+├─ If Notification Service crashes, event lost
+├─ Solution: Kafka persists events
+
+Problem 3: Scaling Consumers
+├─ Without Kafka: Hardcoded consumers
+├─ With Kafka: Add consumers dynamically
+└─ Benefit: Easy to add Notification instances
+
+Problem 4: Event History
+├─ Without: No record of events
+├─ With: Kafka retains events (configurable)
+└─ Benefit: Audit trail, replay if needed
+```
+
+### Auth Service Kafka Flow
+
+```
+User Registration:
+1. POST /api/v1/auth/register
+2. Auth Service:
+   ├─ Validate input
+   ├─ Hash password
+   ├─ Save user to MySQL
+   ├─ Generate OTP
+   ├─ Create VerificationOtpEvent
+   └─ Publish to Kafka (otp-topic)
+
+3. Kafka:
+   ├─ Receives event
+   ├─ Stores in topic partition
+   └─ Persists to disk
+
+4. Notification Service (when deployed):
+   ├─ Reads from otp-topic
+   ├─ Extracts email and OTP
+   ├─ Calls email provider
+   └─ Sends email
+
+5. User receives:
+   ├─ Email with OTP
+   └─ Can verify email by calling /api/v1/auth/verify
+
+6. After verification:
+   ├─ User status → ACTIVE
+   └─ Can login to system
+```
+
+### Step-by-Step Kafka Setup
+
+**Step 1: Start Kafka on EC2**
+
+```bash
+# SSH into EC2
+ssh -i key.pem ubuntu@ec2-instance.ap-south-1.compute.amazonaws.com
+
+# Create docker-compose.yml:
+version: '3'
+services:
+  kafka:
+    image: apache/kafka:4.0.1
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://10.0.1.87:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_CLEANUP_POLICY: delete
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+
+# Start Kafka
+docker-compose up -d
+```
+
+**Step 2: Create Kafka Topics**
+
+```bash
+# Access Kafka container
+docker exec kafka bash
+
+# Create otp-topic
+bin/kafka-topics.sh \
+  --create \
+  --topic otp-topic \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 \
+  --replication-factor 1
+
+# Create auth-events topic
+bin/kafka-topics.sh \
+  --create \
+  --topic auth-events \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 \
+  --replication-factor 1
+
+# List topics
+bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+```
+
+**Step 3: Configure Auth Service Kafka Producer**
+
+```yaml
+# application.yml
+spring:
+  kafka:
+    bootstrap-servers: 10.0.1.87:9092
+    producer:
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+
+# Java code
+@Service
+public class OTPEventProducer {
+  @Autowired
+  private KafkaTemplate<String, VerificationOtpEvent> kafkaTemplate;
+  
+  public void publishOTPEvent(String email, String otp) {
+    VerificationOtpEvent event = new VerificationOtpEvent();
+    event.setEmail(email);
+    event.setOtp(otp);
+    event.setTimestamp(System.currentTimeMillis());
+    
+    kafkaTemplate.send("otp-topic", email, event);
+  }
+}
+
+# In registration endpoint
+@PostMapping("/register")
+public ResponseEntity<?> register(@RequestBody RegisterRequest request) {
+  // ... validation and user creation ...
+  
+  String otp = generateOTP();
+  
+  // Publish to Kafka
+  otpEventProducer.publishOTPEvent(request.getEmail(), otp);
+  
+  return ResponseEntity.status(HttpStatus.CREATED).body(new RegistrationResponse(...));
+}
+```
+
+**Step 4: Verify Producer Works**
+
+```bash
+# Subscribe to topic to see messages
+docker exec kafka bin/kafka-console-consumer.sh \
+  --topic otp-topic \
+  --bootstrap-server localhost:9092 \
+  --from-beginning
+
+# Make registration request
+curl -X POST http://auth-service/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"Pass@123"}'
+
+# Should see OTP event appear in consumer output:
+# {"email":"test@example.com","otp":"123456","timestamp":1693478400000}
+```
+
+---
+
+## Key Lessons Learned
+
+### Lesson 1: 504 Doesn't Mean Operation Failed
+
+```
+Misconception:
+├─ 504 response
+└─ Request failed, user not created
+
+Reality:
+├─ 504 response from ALB timeout
+├─ BUT user was likely already created in database
+├─ AND OTP was generated
+├─ AND event was published (or hanging on Kafka)
+└─ Retry could create duplicate user
+
+Implication:
+├─ Check database for data even after 504
+├─ Consider idempotency (generate same OTP for same email)
+└─ Don't blindly retry without checking state
+```
+
+### Lesson 2: ALB Health Checks ≠ Business Logic Health
+
+```
+Health Check: /actuator/health
+├─ Tests if application started
+├─ Tests database connectivity
+├─ Returns 200 OK if basic functions work
+└─ Good for infrastructure health
+
+Business Logic Problem:
+├─ Kafka topic missing
+├─ Causes timeout
+├─ But health check still passes
+└─ Application "healthy" but functionally broken
+
+Implication:
+├─ Health checks are not comprehensive
+├─ Check application logs for actual errors
+├─ Monitor business metrics separately
+└─ ALB thinks everything is fine, but users get timeouts
+```
+
+### Lesson 3: Service Connect is for Internal Communication
+
+```
+ALB (External Traffic):
+├─ Handles traffic from internet
+├─ Routes to ECS tasks
+└─ Example: auth-alb → Auth Service tasks
+
+Service Connect (Internal Traffic):
+├─ Handles service-to-service communication
+├─ Auth Service → Eureka Server
+├─ Auth Service → Config Server
+└─ DNS-based discovery
+
+Don't Confuse:
+├─ ALB is NOT for internal communication
+├─ Service Connect is NOT for external traffic
+└─ Both needed, different purposes
+```
+
+### Lesson 4: Kafka Doesn't Need Consumers to Store Events
+
+```
+Misconception:
+├─ If Notification Service not deployed
+├─ Kafka won't accept messages
+├─ Or messages are lost
+
+Reality:
+├─ Kafka stores events regardless of consumers
+├─ Consumer just reads what's there
+├─ If Notification Service deployed later, it reads past events
+└─ Kafka persists based on retention policy
+
+Implication:
+├─ Deploy producer first
+├─ Events queue up waiting for consumer
+├─ Deploy consumer later, it processes queued events
+└─ Good for phased deployments
+```
+
+### Lesson 5: Infrastructure Layers Are Separate
+
+```
+ECS Task Status:
+├─ Task RUNNING
+└─ ✅ Task is up
+
+Target Health:
+├─ Target HEALTHY
+└─ ✅ ALB can reach task
+
+Health Endpoint:
+├─ /actuator/health returns 200
+└─ ✅ Application responding
+
+Business Operation:
+├─ Registration call times out
+└─ ❌ Something in business logic hanging
+
+Each layer must be verified separately:
+├─ Don't assume one layer is fine
+├─ Check all layers when troubleshooting
+└─ Problem often deeper than it appears
+```
+
+### Lesson 6: Infrastructure Dependencies Must Exist First
+
+```
+Deployment Order Matters:
+1. Infrastructure (VPC, RDS, Kafka, Redis) ← Must be first
+2. Config Server ← Services need config
+3. Eureka ← Services need discovery
+4. Application Services ← Depend on above
+
+If Services Deployed First:
+├─ Config Server not running
+├─ Can't fetch configuration
+├─ Service startup fails
+└─ Application never registers with Eureka
+
+If Eureka Not Ready:
+├─ Services can't register
+├─ Other services can't discover them
+└─ Service-to-service calls fail
+
+Implication:
+├─ Plan deployment sequence carefully
+├─ Build scripts to automate order
+└─ Document dependencies
+```
+
+---
+
+## Summary and Next Steps
+
+### Current Status
+
+```
+✅ COMPLETE:
+├─ AWS Infrastructure (VPC, Subnets, Security Groups)
+├─ Amazon ECR (Container registry)
+├─ Amazon ECS & Fargate (Container orchestration)
+├─ Config Server (Configuration management)
+├─ Eureka Server (Service discovery)
+├─ Auth Service (Authentication)
+├─ Application Load Balancer
+├─ ECS Service Connect (Internal networking)
+├─ Kafka (Event streaming)
+└─ OTP event publishing
+
+❌ PENDING:
+├─ Notification Service (Email/SMS)
+├─ OTP email delivery
+├─ Email verification flow
+├─ User activation
+├─ Account Service
+├─ User Service
+├─ Transaction Service
+└─ API Gateway
+```
+
+### Next Phase: Notification Service
+
+```
+Notification Service will:
+1. Consume VerificationOtpEvent from Kafka
+2. Configure email provider (SendGrid, AWS SES, etc.)
+3. Send OTP to user's email
+4. Complete email verification flow
+
+Deployment Steps:
+├─ Build Notification Service Spring Boot app
+├─ Add Kafka consumer configuration
+├─ Add email provider integration
+├─ Test locally
+├─ Build Docker image
+├─ Push to ECR
+├─ Create ECS task definition
+├─ Create ECS service
+├─ Enable Service Connect
+├─ Deploy
+└─ Test end-to-end flow
+```
+
+---
+
+## Interview-Ready Explanations
+
+### "Walk me through your CitiCore deployment"
+
+**Response:**
+
+"I'm building a microservices banking platform on AWS. The architecture is:
+
+1. **Infrastructure**: I created a VPC with public subnets for the load balancer, private subnets for application services, and database subnets for RDS.
+
+2. **Container Orchestration**: I use ECS with Fargate for serverless container management. This means I just specify how many tasks to run and Fargate manages the servers.
+
+3. **Configuration Management**: Config Server centralizes configuration in a GitHub repository. Services fetch config at startup instead of hardcoding values.
+
+4. **Service Discovery**: Eureka is the service registry. Services register with Eureka, and other services discover them dynamically. This solves the problem of Fargate tasks getting new IPs when they restart.
+
+5. **Load Balancing**: ALB distributes external traffic across Auth Service tasks. If a task crashes, ALB automatically routes traffic to healthy ones.
+
+6. **Internal Communication**: Service Connect provides DNS-based discovery for service-to-service communication (Auth → Eureka, Auth → Config Server).
+
+7. **Event Streaming**: Kafka decouples services. Auth Service publishes OTP events to Kafka, and the Notification Service consumes them to send emails.
+
+The deployment order was intentional: infrastructure first, then Config Server, then Eureka, then Auth Service. Each service depends on previous layers.
+
+I encountered issues like a 504 timeout caused by a missing Kafka topic, and UnknownHostException because Service Connect wasn't enabled on Eureka. Troubleshooting involved checking each layer: ECS task status, ALB target health, application logs, and external dependencies."
+
+---
