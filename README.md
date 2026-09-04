@@ -11708,3 +11708,1876 @@ Result: Both DB and Kafka always consistent
 ```
 
 ---
+# CitiCore Auth Service
+
+**Enterprise-grade authentication and authorization microservice for banking operations, providing JWT-based token management, role-based access control, and secure credential validation across the CitiCore platform.**
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Authentication Architecture](#authentication-architecture)
+3. [Why Auth Service Matters](#why-auth-service-matters)
+4. [Spring Cloud Integration](#spring-cloud-integration)
+5. [JWT Implementation](#jwt-implementation)
+6. [Real Issues & Solutions](#real-issues--solutions)
+7. [Configuration](#configuration)
+8. [Deployment](#deployment)
+9. [API Endpoints](#api-endpoints)
+10. [Security Best Practices](#security-best-practices)
+11. [Troubleshooting](#troubleshooting)
+12. [Interview-Ready Decisions](#interview-ready-decisions)
+
+---
+
+## Overview
+
+### What is Auth Service?
+
+The Auth Service is a dedicated microservice responsible for:
+
+```
+User/Client
+    |
+    v
+Auth Service
+    |
+    +── Validates credentials
+    +── Issues JWT tokens
+    +── Manages refresh tokens
+    +── Enforces role-based access
+    +── Validates token expiration
+    |
+    v
+Protected Resource Access
+    |
+    v
+Account Service, User Service, Transaction Service
+```
+
+### Core Responsibilities
+
+```
+Authentication (Who are you?)
+├─ Validate username/password
+├─ Check against RDS database
+├─ Issue JWT token
+└─ Return refresh token
+
+Authorization (What can you do?)
+├─ Check user roles
+├─ Validate permissions
+├─ Enforce business rules
+└─ Grant/deny access
+
+Token Management
+├─ Issue short-lived access tokens
+├─ Issue long-lived refresh tokens
+├─ Handle token expiration
+├─ Support token revocation
+└─ Manage token blacklist
+```
+
+### Architecture Diagram
+
+```
+┌──────────────────────────────────────────────────┐
+│              Client Application                  │
+│  (Web Browser, Mobile App, Third-party)          │
+└─────────────────┬──────────────────────────────┘
+                  │
+                  │ POST /api/v1/auth/register
+                  │ POST /api/v1/auth/login
+                  │
+    ┌─────────────v──────────────┐
+    │    ALB (Public)            │
+    │  Port 443 (HTTPS)          │
+    └─────────────┬──────────────┘
+                  │
+    ┌─────────────v──────────────────────────┐
+    │    Auth Service (ECS/Fargate)          │
+    │    Port 8085                           │
+    │                                        │
+    │  ┌────────────────────────────────┐   │
+    │  │ Registration Handler           │   │
+    │  │ - Validate email format        │   │
+    │  │ - Hash password                │   │
+    │  │ - Store in RDS                 │   │
+    │  └────────────────────────────────┘   │
+    │                                        │
+    │  ┌────────────────────────────────┐   │
+    │  │ Login Handler                  │   │
+    │  │ - Query RDS for user           │   │
+    │  │ - Verify password              │   │
+    │  │ - Generate JWT                 │   │
+    │  │ - Cache in Redis               │   │
+    │  └────────────────────────────────┘   │
+    │                                        │
+    │  ┌────────────────────────────────┐   │
+    │  │ Validation Handler             │   │
+    │  │ - Verify JWT signature         │   │
+    │  │ - Check expiration             │   │
+    │  │ - Validate claims              │   │
+    │  └────────────────────────────────┘   │
+    │                                        │
+    │  ┌────────────────────────────────┐   │
+    │  │ Token Refresh Handler          │   │
+    │  │ - Check refresh token          │   │
+    │  │ - Issue new access token       │   │
+    │  └────────────────────────────────┘   │
+    └─────────────┬──────────────────────────┘
+                  │
+        ┌─────────┼─────────┬──────────┐
+        │         │         │          │
+        v         v         v          v
+      RDS      Redis    Eureka    Config
+     MySQL     Cache    Registry   Server
+```
+
+---
+
+## Authentication Architecture
+
+### JWT (JSON Web Token) Flow
+
+```
+1. USER REGISTRATION
+   ┌─────────────────────────────────────────┐
+   │ POST /api/v1/auth/register              │
+   │ {                                       │
+   │   "email": "user@example.com",          │
+   │   "password": "SecurePass@123"          │
+   │ }                                       │
+   └─────────────────────────────────────────┘
+              ↓
+   ┌─────────────────────────────────────────┐
+   │ Auth Service Processing:                │
+   │ 1. Validate email format                │
+   │ 2. Check email not already registered   │
+   │ 3. Hash password with BCrypt            │
+   │ 4. Store user in RDS                    │
+   │ 5. Return 201 Created                   │
+   └─────────────────────────────────────────┘
+              ↓
+   ┌─────────────────────────────────────────┐
+   │ Database State:                         │
+   │ users table:                            │
+   │ - id: 1                                 │
+   │ - email: user@example.com               │
+   │ - password_hash: $2b$10$... (hashed)   │
+   │ - role: USER                            │
+   │ - created_at: now()                     │
+   └─────────────────────────────────────────┘
+
+
+2. USER LOGIN
+   ┌─────────────────────────────────────────┐
+   │ POST /api/v1/auth/login                 │
+   │ {                                       │
+   │   "email": "user@example.com",          │
+   │   "password": "SecurePass@123"          │
+   │ }                                       │
+   └─────────────────────────────────────────┘
+              ↓
+   ┌─────────────────────────────────────────┐
+   │ Auth Service Processing:                │
+   │ 1. Query RDS for user by email          │
+   │ 2. Compare provided password with hash  │
+   │ 3. If match:                            │
+   │    - Generate access token (15 min)     │
+   │    - Generate refresh token (7 days)    │
+   │    - Cache tokens in Redis              │
+   │    - Return both tokens                 │
+   │ 4. If no match: 401 Unauthorized        │
+   └─────────────────────────────────────────┘
+              ↓
+   ┌─────────────────────────────────────────┐
+   │ JWT Structure:                          │
+   │                                         │
+   │ Header:                                 │
+   │ {                                       │
+   │   "alg": "HS256",                       │
+   │   "typ": "JWT"                          │
+   │ }                                       │
+   │                                         │
+   │ Payload (Claims):                       │
+   │ {                                       │
+   │   "sub": "user@example.com",            │
+   │   "userId": 1,                          │
+   │   "role": "USER",                       │
+   │   "iat": 1693478400,                    │
+   │   "exp": 1693479300  (15 min later)     │
+   │ }                                       │
+   │                                         │
+   │ Signature:                              │
+   │ HMACSHA256(                             │
+   │   base64UrlEncode(header) + "." +       │
+   │   base64UrlEncode(payload),             │
+   │   JWT_SECRET                            │
+   │ )                                       │
+   └─────────────────────────────────────────┘
+              ↓
+   ┌─────────────────────────────────────────┐
+   │ Response to Client:                     │
+   │ {                                       │
+   │   "accessToken":                        │
+   │     "eyJhbGciOiJIUzI1NiIs...",         │
+   │   "refreshToken":                       │
+   │     "eyJhbGciOiJIUzI1NiIs...",         │
+   │   "expiresIn": 900,                     │
+   │   "tokenType": "Bearer"                 │
+   │ }                                       │
+   └─────────────────────────────────────────┘
+
+
+3. ACCESSING PROTECTED RESOURCE
+   ┌─────────────────────────────────────────┐
+   │ GET /api/v1/accounts                    │
+   │ Headers: {                              │
+   │   "Authorization":                      │
+   │     "Bearer eyJhbGciOiJIUzI1NiIs..."   │
+   │ }                                       │
+   └─────────────────────────────────────────┘
+              ↓
+   ┌─────────────────────────────────────────┐
+   │ Account Service Processing:             │
+   │ 1. Extract token from Authorization     │
+   │ 2. Call Auth Service to validate        │
+   │ 3. Auth Service:                        │
+   │    - Verify signature with JWT_SECRET   │
+   │    - Check expiration time              │
+   │    - Verify claims (role, userId)       │
+   │    - Return user info if valid          │
+   │    - Return 401 if invalid              │
+   │ 4. If valid: return protected resource  │
+   │ 5. If invalid: return 401 Unauthorized  │
+   └─────────────────────────────────────────┘
+
+
+4. TOKEN REFRESH
+   ┌─────────────────────────────────────────┐
+   │ POST /api/v1/auth/refresh               │
+   │ {                                       │
+   │   "refreshToken": "eyJhbGc..."         │
+   │ }                                       │
+   └─────────────────────────────────────────┘
+              ↓
+   ┌─────────────────────────────────────────┐
+   │ Auth Service Processing:                │
+   │ 1. Verify refresh token is valid        │
+   │ 2. Check it hasn't expired (7 days)     │
+   │ 3. Check it's not blacklisted           │
+   │ 4. Issue new access token               │
+   │ 5. Return new access token              │
+   └─────────────────────────────────────────┘
+```
+
+### Token Lifecycle
+
+```
+Access Token Lifetime: 15 minutes
+├─ Short-lived for security
+├─ Forces periodic refresh
+├─ Minimizes breach impact window
+└─ If compromised, limited exposure
+
+Refresh Token Lifetime: 7 days
+├─ Longer-lived for convenience
+├─ Stored securely (Redis, DB)
+├─ Can be revoked on logout
+└─ Enables "remember me" functionality
+
+Expiration Handling:
+├─ Client: Monitor expiration time
+├─ When approaching expiration:
+│  ├─ Request new access token using refresh token
+│  └─ Continue seamlessly
+├─ If both expired:
+│  └─ User must login again
+└─ No interruption to user experience if timed properly
+```
+
+---
+
+## Why Auth Service Matters
+
+### Banking Context
+
+In banking applications, authentication is critical:
+
+```
+Authentication Failure = Security Breach
+
+✗ Wrong person accesses account
+  → Fraudulent transactions
+  → Customer funds stolen
+  → Regulatory violations
+  → Lost trust
+
+✗ Tokens compromised
+  → Attacker impersonates user
+  → Unauthorized transfers
+  → Account takeover
+
+✗ Session hijacking
+  → Man-in-the-middle attack
+  → Credentials leaked
+  → Multi-account compromise
+```
+
+### Architectural Benefits
+
+Separating Auth Service provides:
+
+```
+1. SECURITY ISOLATION
+   ├─ Auth logic centralized
+   ├─ Easier to audit
+   ├─ Single point of policy enforcement
+   └─ Reduces attack surface
+
+2. SCALABILITY
+   ├─ Auth Service scales independently
+   ├─ Other services don't handle auth logic
+   ├─ Can add caching layer (Redis)
+   └─ Reduces latency for token validation
+
+3. CONSISTENCY
+   ├─ All services use same auth rules
+   ├─ Prevents inconsistency bugs
+   ├─ Centralized policy updates
+   └─ No duplicate logic
+
+4. COMPLIANCE
+   ├─ Audit trails for auth events
+   ├─ Password policies enforced
+   ├─ Token expiration managed
+   └─ Supports regulatory requirements (PCI-DSS, etc.)
+```
+
+---
+
+## Spring Cloud Integration
+
+### Version Alignment Importance
+
+The Auth Service deployment initially failed because of version mismatch:
+
+```
+BEFORE (504 Timeout):
+├─ Spring Boot: 4.0.5 (too new)
+├─ Spring Cloud: 2025.1.1 (too new)
+├─ Incompatible with Eureka 2023.0.3
+├─ ClassNotFoundException at runtime
+└─ Result: 504 Gateway Timeout
+
+AFTER (Working):
+├─ Spring Boot: 3.2.4 (aligned)
+├─ Spring Cloud: 2023.0.3 (aligned)
+├─ Java 17 (consistent)
+├─ All dependencies compatible
+└─ Result: 200 OK
+```
+
+### pom.xml Configuration
+
+```xml
+<!-- Parent Version - CRITICAL -->
+<parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.2.4</version>
+    <relativePath/>
+</parent>
+
+<!-- Dependency Management -->
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-dependencies</artifactId>
+            <version>2023.0.3</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+
+<!-- Core Dependencies -->
+<dependencies>
+    <!-- Spring Cloud Netflix Eureka Client -->
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-netflix-eureka-client</artifactId>
+    </dependency>
+
+    <!-- Spring Cloud Config Client -->
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-config</artifactId>
+    </dependency>
+
+    <!-- Spring Cloud Bus (Config refresh) -->
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-bus</artifactId>
+    </dependency>
+
+    <!-- Kafka for Spring Cloud Bus -->
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-bus-kafka</artifactId>
+    </dependency>
+
+    <!-- Spring Web -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+
+    <!-- Spring Security -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+
+    <!-- Spring Data JPA -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+
+    <!-- MySQL Driver with TLS Support -->
+    <dependency>
+        <groupId>com.mysql</groupId>
+        <artifactId>mysql-connector-j</artifactId>
+        <version>8.0.33</version>
+    </dependency>
+
+    <!-- JWT Token Generation -->
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-api</artifactId>
+        <version>0.12.3</version>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-impl</artifactId>
+        <version>0.12.3</version>
+        <scope>runtime</scope>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-jackson</artifactId>
+        <version>0.12.3</version>
+        <scope>runtime</scope>
+    </dependency>
+
+    <!-- Redis for Token Caching -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+
+    <!-- Kafka Events Library (shared) -->
+    <dependency>
+        <groupId>com.citicore</groupId>
+        <artifactId>kafka-events</artifactId>
+        <version>1.0.0</version>
+    </dependency>
+
+    <!-- Actuator for Health Checks -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+</dependencies>
+
+<properties>
+    <java.version>17</java.version>
+    <maven.compiler.source>17</maven.compiler.source>
+    <maven.compiler.target>17</maven.compiler.target>
+</properties>
+```
+
+### bootstrap.yml Configuration
+
+```yaml
+# src/main/resources/bootstrap.yml
+# Loaded BEFORE application.yml
+# Essential for Config Server and Eureka initialization
+
+spring:
+  application:
+    name: auth-service
+  
+  cloud:
+    config:
+      enabled: true
+      uri: http://config-server:8888
+      fail-fast: true
+      retry:
+        initial-interval: 1000
+        max-interval: 2000
+        max-attempts: 6
+
+eureka:
+  client:
+    register-with-eureka: true
+    fetch-registry: true
+    service-url:
+      defaultZone: http://eureka-server:8761/eureka/
+    registry-fetch-interval-seconds: 30
+    instance-info-replication-interval-seconds: 30
+    
+  instance:
+    hostname: auth-service
+    lease-renewal-interval-in-seconds: 10
+    lease-expiration-duration-in-seconds: 30
+    health-check-url-path: /actuator/health
+```
+
+---
+
+## JWT Implementation
+
+### JWT Secret Management
+
+```java
+@Configuration
+public class JwtConfig {
+    
+    @Value("${jwt.secret}")
+    private String jwtSecret;
+    
+    @Value("${jwt.expiration:900000}")  // 15 minutes default
+    private int jwtExpiration;
+    
+    @Value("${jwt.refresh-expiration:604800000}")  // 7 days default
+    private int refreshExpiration;
+    
+    @Bean
+    public JwtTokenProvider jwtTokenProvider() {
+        return new JwtTokenProvider(jwtSecret, jwtExpiration, refreshExpiration);
+    }
+}
+```
+
+### Token Generation
+
+```java
+@Service
+public class JwtTokenProvider {
+    
+    private final String secretKey;
+    private final int expiration;
+    private final int refreshExpiration;
+    
+    public JwtTokenProvider(String secretKey, int expiration, int refreshExpiration) {
+        this.secretKey = secretKey;
+        this.expiration = expiration;
+        this.refreshExpiration = refreshExpiration;
+    }
+    
+    // Generate Access Token (short-lived)
+    public String generateAccessToken(UserDetails userDetails) {
+        return createToken(userDetails.getUsername(), expiration, "ACCESS");
+    }
+    
+    // Generate Refresh Token (long-lived)
+    public String generateRefreshToken(UserDetails userDetails) {
+        return createToken(userDetails.getUsername(), refreshExpiration, "REFRESH");
+    }
+    
+    private String createToken(String email, int duration, String type) {
+        Date now = new Date();
+        Date expiryDate = new Date(now.getTime() + duration);
+        
+        return Jwts.builder()
+            .subject(email)
+            .claim("type", type)
+            .issuedAt(now)
+            .expiration(expiryDate)
+            .signWith(Keys.hmacShaKeyFor(secretKey.getBytes()), SignatureAlgorithm.HS256)
+            .compact();
+    }
+    
+    // Validate Token
+    public boolean validateToken(String token) {
+        try {
+            Jwts.parserBuilder()
+                .setSigningKey(Keys.hmacShaKeyFor(secretKey.getBytes()))
+                .build()
+                .parseClaimsJws(token);
+            return true;
+        } catch (JwtException | IllegalArgumentException e) {
+            return false;
+        }
+    }
+    
+    // Extract Email from Token
+    public String getEmailFromToken(String token) {
+        Claims claims = Jwts.parserBuilder()
+            .setSigningKey(Keys.hmacShaKeyFor(secretKey.getBytes()))
+            .build()
+            .parseClaimsJws(token)
+            .getBody();
+        
+        return claims.getSubject();
+    }
+}
+```
+
+### Security Configuration
+
+```java
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+    
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf().disable()
+            .authorizeRequests()
+                .requestMatchers("/api/v1/auth/**").permitAll()
+                .requestMatchers("/actuator/health").permitAll()
+                .anyRequest().authenticated()
+            .and()
+            .addFilter(new JwtAuthenticationFilter(jwtTokenProvider))
+            .sessionManagement()
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS);
+        
+        return http.build();
+    }
+    
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+}
+```
+
+---
+
+## Real Issues & Solutions
+
+### Issue #1: Spring Cloud Version Mismatch (504 Timeout)
+
+**Error Encountered:**
+
+```
+POST http://auth-alb.../api/v1/auth/register
+Status: 504 Gateway Timeout
+Time: 16.58 seconds
+Error: "upstream request timeout"
+```
+
+**Root Cause:**
+
+Auth Service pom.xml used Spring Boot 4.0.5 and Spring Cloud 2025.1.1, incompatible with Eureka 2023.0.3 used by CitiCore.
+
+```
+Spring Boot 4.0.5
+    ↓
+Incompatible class signatures
+    ↓
+ClassNotFoundException at Eureka registration
+    ↓
+App hangs during initialization
+    ↓
+ALB health check timeout
+    ↓
+504 returned to client
+```
+
+**Solution:**
+
+Updated pom.xml to align with CitiCore ecosystem:
+
+```xml
+<!-- BEFORE (WRONG) -->
+<parent>
+    <version>4.0.5</version>  <!-- Too new -->
+</parent>
+
+<!-- AFTER (CORRECT) -->
+<parent>
+    <version>3.2.4</version>  <!-- Aligned -->
+</parent>
+
+<dependencyManagement>
+    <dependency>
+        <artifactId>spring-cloud-dependencies</artifactId>
+        <version>2023.0.3</version>  <!-- Aligned -->
+    </dependency>
+</dependencyManagement>
+```
+
+**Interview Narrative:**
+
+"Version management in a microservices ecosystem is critical. I initially created Auth Service with the latest Spring Boot and Cloud versions (4.0.5, 2025.1.1), which caused 504 timeouts. The issue was subtle—the application started but encountered ClassNotFoundException when registering with Eureka due to incompatible serialization formats. By aligning with the existing CitiCore stack (Spring Boot 3.2.4, Cloud 2023.0.3), I ensured all services speak the same language. This taught me that 'latest' is not always 'best' in a constrained ecosystem; consistency beats features."
+
+---
+
+### Issue #2: Eureka Registration Failure
+
+**Error Encountered:**
+
+```
+Auth Service starts but doesn't appear in Eureka registry.
+CloudWatch logs show: "Cannot register with Eureka"
+```
+
+**Root Cause:**
+
+`eureka.client.service-url.defaultZone` was not configured in bootstrap.yml. Auth Service tried to register but didn't know where Eureka Server was.
+
+**Solution:**
+
+Created `bootstrap.yml` with proper Eureka configuration:
+
+```yaml
+eureka:
+  client:
+    register-with-eureka: true
+    fetch-registry: true
+    service-url:
+      defaultZone: http://eureka-server:8761/eureka/
+  instance:
+    hostname: auth-service
+    lease-renewal-interval-in-seconds: 10
+```
+
+**Verification:**
+
+```bash
+curl http://eureka-server:8761/eureka/apps/AUTH-SERVICE
+# Now returns:
+{
+  "application": {
+    "name": "AUTH-SERVICE",
+    "instance": {
+      "instanceId": "auth-service",
+      "hostName": "auth-service",
+      "app": "AUTH-SERVICE",
+      "ipAddr": "10.0.11.50",
+      "status": "UP"
+    }
+  }
+}
+```
+
+---
+
+### Issue #3: Config Server Bootstrap Failure
+
+**Error Encountered:**
+
+```
+Auth Service initialization hangs after Eureka registration.
+CloudWatch: "No config server found"
+```
+
+**Root Cause:**
+
+Config Server URL not configured in bootstrap.yml. Auth Service tried to fetch configuration but timed out waiting for response.
+
+**Solution:**
+
+Added Config Server configuration:
+
+```yaml
+spring:
+  cloud:
+    config:
+      enabled: true
+      uri: http://config-server:8888
+      fail-fast: true
+      retry:
+        initial-interval: 1000
+        max-interval: 2000
+        max-attempts: 6
+```
+
+**Verification:**
+
+```bash
+# Config Server returns auth-service configuration
+curl http://config-server:8888/auth-service/default
+# Response: application properties from GitHub config repo
+```
+
+---
+
+### Issue #4: RDS Connection Timeout
+
+**Error Encountered:**
+
+```
+HikariCP connection pool hangs
+CloudWatch: "Failed to connect to RDS"
+Timeout after 30 seconds
+```
+
+**Root Cause:**
+
+RDS security group didn't allow inbound TCP:3306 from ECS security group.
+
+**Solution:**
+
+Added security group rule:
+
+```bash
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-rds-id \
+  --protocol tcp \
+  --port 3306 \
+  --source-group sg-ecs-id \
+  --region ap-south-1
+```
+
+Plus verified JDBC URL configuration:
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:mysql://citicore-mysql-primary.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com:3306/citicore_auth?sslMode=VERIFY_IDENTITY&serverTimezone=UTC
+    username: app_primary
+    password: ${DB_PASSWORD}
+```
+
+**Verification:**
+
+```bash
+mysql -h citicore-mysql-primary.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com \
+  -u app_primary -p \
+  --ssl-mode=VERIFY_IDENTITY \
+  -e "SELECT 1"
+# Returns: 1 (success)
+```
+
+---
+
+### Issue #5: JWT Secret Not Configured
+
+**Error Encountered:**
+
+```
+POST /api/v1/auth/login
+Response: NullPointerException on JWT generation
+CloudWatch: "JWT secret key is null"
+```
+
+**Root Cause:**
+
+JWT secret key stored in AWS Secrets Manager but not provided to application via environment variable.
+
+**Solution:**
+
+Created secret in AWS Secrets Manager:
+
+```bash
+aws secretsmanager create-secret \
+  --name citicore/auth-service/jwt-secret \
+  --secret-string "your-super-secret-jwt-key-min-32-chars" \
+  --region ap-south-1
+```
+
+Updated ECS Task Definition:
+
+```json
+{
+  "secrets": [
+    {
+      "name": "JWT_SECRET",
+      "valueFrom": "arn:aws:secretsmanager:ap-south-1:580655778303:secret:citicore/auth-service/jwt-secret"
+    }
+  ]
+}
+```
+
+Updated application.yml:
+
+```yaml
+jwt:
+  secret: ${JWT_SECRET}
+  expiration: 900000  # 15 minutes
+  refresh-expiration: 604800000  # 7 days
+```
+
+---
+
+### Issue #6: ALB Health Check Failing
+
+**Error Encountered:**
+
+```
+ALB shows: Target is UNHEALTHY
+Reason: health checks failing
+Auth Service marked as down by ALB
+```
+
+**Root Cause:**
+
+ALB health check was hitting `/api/v1/health` instead of `/actuator/health`. Auth Service didn't have that endpoint.
+
+**Solution:**
+
+Updated ALB Target Group health check:
+
+```bash
+aws elbv2 modify-target-group \
+  --target-group-arn arn:... \
+  --health-check-enabled \
+  --health-check-protocol HTTP \
+  --health-check-path /actuator/health \
+  --health-check-interval-seconds 30 \
+  --health-check-timeout-seconds 5 \
+  --healthy-threshold-count 2 \
+  --unhealthy-threshold-count 3 \
+  --region ap-south-1
+```
+
+Also increased health check start period in ECS Task Definition:
+
+```json
+{
+  "healthCheck": {
+    "command": ["CMD-SHELL", "curl -f http://localhost:8085/actuator/health || exit 1"],
+    "interval": 30,
+    "timeout": 5,
+    "retries": 3,
+    "startPeriod": 60  // Critical: 60 seconds for Java startup
+  }
+}
+```
+
+**Verification:**
+
+```bash
+curl http://auth-service-private-ip:8085/actuator/health
+# Response:
+{
+  "status": "UP",
+  "components": {
+    "db": {"status": "UP"},
+    "discoveryComposite": {"status": "UP"}
+  }
+}
+```
+
+---
+
+### Issue #7: Insufficient ECS Task Resources
+
+**Error Encountered:**
+
+```
+Auth Service starts but becomes unresponsive after ~60 seconds
+CloudWatch: Excessive garbage collection
+Request timeouts after app runs briefly
+```
+
+**Root Cause:**
+
+ECS Task Definition allocated only:
+- CPU: 0.25 vCPU (very low)
+- Memory: 512 MB (insufficient)
+
+Spring Boot + Spring Cloud + Dependencies exceeds this memory quickly.
+
+**Solution:**
+
+Increased ECS Task resources significantly:
+
+```json
+{
+  "cpu": "1024",  // 1 vCPU (was 0.25)
+  "memory": "2048",  // 2 GB (was 512 MB)
+  "containerDefinitions": [
+    {
+      "cpu": 1024,
+      "memory": 2048
+    }
+  ]
+}
+```
+
+**Why these values:**
+
+```
+CPU: 1024 (1 vCPU)
+├─ Spring Boot startup: ~200ms
+├─ Spring Cloud initialization: ~500ms
+├─ JWT generation: ~50ms per request
+├─ 0.25 vCPU insufficient for all above
+└─ Results in severe throttling
+
+Memory: 2048 MB (2 GB)
+├─ Spring Boot base: ~300 MB
+├─ Spring Cloud libraries: ~400 MB
+├─ JWT + Security libraries: ~200 MB
+├─ Kafka client: ~150 MB
+├─ Redis client: ~100 MB
+├─ RDS connection pool (10 conn): ~150 MB
+├─ User session data: ~100 MB
+├─ Safety margin: ~600 MB
+└─ Total: ~2000 MB needed
+```
+
+**Verification:**
+
+```bash
+# Check task memory usage after update
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/ECS \
+  --metric-name MemoryUtilization \
+  --dimensions Name=ServiceName,Value=citicore-auth-service \
+  --start-time 2026-08-29T00:00:00Z \
+  --end-time 2026-08-29T12:00:00Z \
+  --period 300 \
+  --statistics Average
+
+# Should show ~60-70% utilization (healthy)
+# Not 95%+ (would be exhaustion)
+```
+
+---
+
+### Issue #8: Kafka Events Dependency Missing
+
+**Error Encountered:**
+
+```
+mvn clean package
+ERROR: Could not find artifact com.citicore:kafka-events:jar:1.0.0
+BUILD FAILURE
+```
+
+**Root Cause:**
+
+Auth Service depended on shared `kafka-events` library, but it wasn't built/published.
+
+**Solution:**
+
+Built and installed kafka-events locally:
+
+```bash
+# Navigate to kafka-events module
+cd ~/citicore-platform/kafka-events
+
+# Build the module
+mvn clean package
+
+# Install to local Maven repository
+mvn install
+
+# Verify installation
+ls ~/.m2/repository/com/citicore/kafka-events/1.0.0/
+# Should show: kafka-events-1.0.0.jar
+```
+
+Ensured pom.xml has correct dependency:
+
+```xml
+<dependency>
+    <groupId>com.citicore</groupId>
+    <artifactId>kafka-events</artifactId>
+    <version>1.0.0</version>
+</dependency>
+```
+
+Verified it's included in Docker image:
+
+```bash
+# Check JAR contains kafka-events classes
+jar tf target/auth-service-1.0.0-SNAPSHOT.jar | grep kafka | head -20
+
+# Output should show:
+# com/citicore/kafka/events/AccountEvent.class
+# com/citicore/kafka/events/AuthenticationEvent.class
+# ...
+```
+
+---
+
+### Issue #9: Security Groups Blocking Traffic
+
+**Error Encountered:**
+
+```
+Auth Service running but cannot reach:
+- Eureka (port 8761) → Connection refused
+- Config Server (port 8888) → Connection refused
+- RDS (port 3306) → Connection refused
+```
+
+**Root Cause:**
+
+Outbound traffic from ECS security group not explicitly allowed to other services.
+
+**Solution:**
+
+Added outbound rules:
+
+```bash
+# Allow all outbound traffic
+aws ec2 authorize-security-group-egress \
+  --group-id sg-ecs-id \
+  --protocol -1 \
+  --port -1 \
+  --cidr 0.0.0.0/0 \
+  --region ap-south-1
+```
+
+Or more specific rules:
+
+```bash
+# Allow outbound to Eureka
+aws ec2 authorize-security-group-egress \
+  --group-id sg-ecs-id \
+  --protocol tcp \
+  --port 8761 \
+  --source-group sg-ecs-id \
+  --region ap-south-1
+
+# Allow outbound to Config Server
+aws ec2 authorize-security-group-egress \
+  --group-id sg-ecs-id \
+  --protocol tcp \
+  --port 8888 \
+  --source-group sg-ecs-id \
+  --region ap-south-1
+
+# Allow outbound to RDS
+aws ec2 authorize-security-group-egress \
+  --group-id sg-ecs-id \
+  --protocol tcp \
+  --port 3306 \
+  --source-group sg-rds-id \
+  --region ap-south-1
+```
+
+**Verification:**
+
+```bash
+# Test connectivity from inside ECS task
+aws ecs execute-command \
+  --cluster citicore-cluster \
+  --task <task-arn> \
+  --container auth-service \
+  --interactive \
+  --command "/bin/bash"
+
+# Inside container:
+curl http://eureka-server:8761/actuator/health
+# Should return 200 OK
+
+curl http://config-server:8888/actuator/health
+# Should return 200 OK
+
+mysql -h <rds-endpoint> -u admin -p -e "SELECT 1"
+# Should return 1
+```
+
+---
+
+## Configuration
+
+### bootstrap.yml (Spring Cloud Bootstrap)
+
+```yaml
+spring:
+  application:
+    name: auth-service
+  
+  cloud:
+    config:
+      enabled: true
+      uri: http://config-server:8888
+      fail-fast: true
+      retry:
+        initial-interval: 1000
+        max-interval: 2000
+        max-attempts: 6
+
+eureka:
+  client:
+    register-with-eureka: true
+    fetch-registry: true
+    service-url:
+      defaultZone: http://eureka-server:8761/eureka/
+    registry-fetch-interval-seconds: 30
+    instance-info-replication-interval-seconds: 30
+  
+  instance:
+    hostname: auth-service
+    lease-renewal-interval-in-seconds: 10
+    lease-expiration-duration-in-seconds: 30
+    health-check-url-path: /actuator/health
+```
+
+### application.yml (Runtime Configuration)
+
+```yaml
+server:
+  port: 8085
+  servlet:
+    context-path: /api
+
+spring:
+  application:
+    name: auth-service
+  
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:3306/${MYSQL_DB:citicore_auth}?sslMode=VERIFY_IDENTITY&serverTimezone=UTC
+    username: ${MYSQL_USER:app_primary}
+    password: ${MYSQL_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 3
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+  
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQL8Dialect
+  
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+  
+  redis:
+    host: ${REDIS_HOST:localhost}
+    port: ${REDIS_PORT:6379}
+    timeout: 2000
+    jedis:
+      pool:
+        max-active: 8
+        max-idle: 8
+        min-idle: 0
+
+jwt:
+  secret: ${JWT_SECRET}
+  expiration: 900000  # 15 minutes
+  refresh-expiration: 604800000  # 7 days
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,env,configprops
+  endpoint:
+    health:
+      show-details: always
+    health-probes:
+      enabled: true
+  health:
+    livenessState:
+      enabled: true
+    readinessState:
+      enabled: true
+
+logging:
+  level:
+    com.citicore.auth: DEBUG
+    org.springframework.security: DEBUG
+    org.springframework.cloud: DEBUG
+    org.springframework.web: INFO
+```
+
+### ECS Task Definition
+
+```json
+{
+  "family": "citicore-auth-service",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::580655778303:role/citicore-ecs-task-execution-role",
+  "taskRoleArn": "arn:aws:iam::580655778303:role/citicore-ecs-task-role",
+  "containerDefinitions": [
+    {
+      "name": "auth-service",
+      "image": "580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/auth-service:1.0",
+      "portMappings": [
+        {
+          "containerPort": 8085,
+          "hostPort": 8085,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true,
+      "environment": [
+        {
+          "name": "MYSQL_HOST",
+          "value": "citicore-mysql-primary.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com"
+        },
+        {
+          "name": "MYSQL_DB",
+          "value": "citicore_auth"
+        },
+        {
+          "name": "MYSQL_USER",
+          "value": "app_primary"
+        },
+        {
+          "name": "KAFKA_BOOTSTRAP_SERVERS",
+          "value": "10.0.1.87:9092"
+        },
+        {
+          "name": "REDIS_HOST",
+          "value": "10.0.1.87"
+        },
+        {
+          "name": "REDIS_PORT",
+          "value": "6379"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "MYSQL_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:580655778303:secret:citicore/auth-service/db-password"
+        },
+        {
+          "name": "JWT_SECRET",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:580655778303:secret:citicore/auth-service/jwt-secret"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/citicore-auth-service",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8085/actuator/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}
+```
+
+---
+
+## Deployment
+
+### Complete Deployment Process
+
+```bash
+# 1. Build locally
+cd ~/citicore-platform/auth-service
+mvn clean package -DskipTests
+
+# 2. Build Docker image
+docker build -t citicore/auth-service:1.0 .
+
+# 3. Test locally
+docker run -d \
+  --name auth-test \
+  -p 8085:8085 \
+  -e SPRING_CLOUD_CONFIG_URI=http://host.docker.internal:8888 \
+  -e EUREKA_CLIENT_SERVICEURL_DEFAULTZONE=http://host.docker.internal:8761/eureka/ \
+  -e MYSQL_HOST=host.docker.internal \
+  -e MYSQL_PASSWORD=root123 \
+  citicore/auth-service:1.0
+
+sleep 90
+
+# 4. Test health
+curl http://localhost:8085/actuator/health
+
+# 5. Stop test
+docker stop auth-test
+docker rm auth-test
+
+# 6. Push to ECR
+aws ecr get-login-password --region ap-south-1 | \
+  docker login --username AWS --password-stdin \
+  580655778303.dkr.ecr.ap-south-1.amazonaws.com
+
+docker tag citicore/auth-service:1.0 \
+  580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/auth-service:1.0
+
+docker push 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/auth-service:1.0
+
+# 7. Create/update ECS task definition
+aws ecs register-task-definition \
+  --cli-input-json file://task-definition.json \
+  --region ap-south-1
+
+# 8. Create ECS service
+aws ecs create-service \
+  --cluster citicore-cluster \
+  --service-name citicore-auth-service \
+  --task-definition citicore-auth-service:1 \
+  --desired-count 1 \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={
+    subnets=[subnet-private-a,subnet-private-b],
+    securityGroups=[sg-ecs-id],
+    assignPublicIp=DISABLED
+  }" \
+  --load-balancers targetGroupArn=arn:...,containerName=auth-service,containerPort=8085 \
+  --region ap-south-1
+
+# 9. Wait for service stability
+aws ecs wait services-stable \
+  --cluster citicore-cluster \
+  --services citicore-auth-service \
+  --region ap-south-1
+
+echo "Auth Service deployed successfully!"
+```
+
+---
+
+## API Endpoints
+
+### Authentication Endpoints
+
+```
+POST /api/v1/auth/register
+├─ Register new user
+├─ Body: {"email": "...", "password": "..."}
+├─ Response: 201 Created
+└─ Errors: 400 (invalid), 409 (duplicate)
+
+POST /api/v1/auth/login
+├─ Authenticate user
+├─ Body: {"email": "...", "password": "..."}
+├─ Response: 200 OK {accessToken, refreshToken, expiresIn}
+└─ Errors: 401 (invalid credentials)
+
+POST /api/v1/auth/refresh
+├─ Refresh access token
+├─ Body: {"refreshToken": "..."}
+├─ Response: 200 OK {accessToken, expiresIn}
+└─ Errors: 401 (invalid token)
+
+POST /api/v1/auth/validate
+├─ Validate JWT token
+├─ Body: {"token": "..."}
+├─ Response: 200 OK {valid: true, email: "...", role: "..."}
+└─ Errors: 401 (invalid token)
+
+POST /api/v1/auth/logout
+├─ Logout user (blacklist token)
+├─ Headers: {"Authorization": "Bearer ..."}
+├─ Response: 200 OK
+└─ Errors: 401 (unauthorized)
+```
+
+---
+
+## Security Best Practices
+
+### 1. Password Security
+
+```java
+// Hash passwords with BCrypt (never store plaintext)
+@Bean
+public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder();
+}
+
+// BCrypt automatically:
+// - Generates salt
+// - Hashes with cost factor 10
+// - Makes rainbow table attacks infeasible
+```
+
+### 2. JWT Security
+
+```yaml
+# Short-lived access tokens (15 minutes)
+jwt.expiration: 900000
+
+# Longer-lived refresh tokens (7 days)
+jwt.refresh-expiration: 604800000
+
+# Strong secret key (min 32 chars, random, alphanumeric + special)
+jwt.secret: YourSuper$ecretJWT@Key#Min32Chars!
+```
+
+### 3. HTTPS Only
+
+```
+ALB enforces HTTPS on port 443
+├─ HTTP (80) redirects to HTTPS
+├─ All tokens sent over encrypted channel
+└─ Prevents man-in-the-middle attacks
+```
+
+### 4. Rate Limiting
+
+```java
+// Prevent brute force attacks
+@RateLimiter(value = "auth-api", rate = "10")
+@PostMapping("/login")
+public ResponseEntity<?> login(@RequestBody LoginRequest request) {
+    // Max 10 login attempts per minute
+}
+```
+
+### 5. Token Blacklist/Revocation
+
+```java
+// On logout, blacklist token in Redis
+@Service
+public class TokenBlacklistService {
+    
+    @Autowired
+    private RedisTemplate<String, Boolean> redisTemplate;
+    
+    public void blacklistToken(String token, long expirationTime) {
+        String key = "blacklist:" + token;
+        redisTemplate.opsForValue().set(
+            key, 
+            true, 
+            Duration.ofMillis(expirationTime)
+        );
+    }
+    
+    public boolean isBlacklisted(String token) {
+        return Boolean.TRUE.equals(
+            redisTemplate.opsForValue().get("blacklist:" + token)
+        );
+    }
+}
+```
+
+### 6. Audit Logging
+
+```java
+// Log all authentication events
+@Component
+public class AuthenticationAuditListener {
+    
+    @EventListener
+    public void onAuthenticationSuccess(AuthenticationSuccessEvent event) {
+        logger.info("Authentication successful: user={}, ip={}", 
+            event.getAuthentication().getName(),
+            getClientIp());
+    }
+    
+    @EventListener
+    public void onAuthenticationFailure(AuthenticationFailureEvent event) {
+        logger.warn("Authentication failed: user={}, reason={}",
+            event.getAuthentication().getName(),
+            event.getException().getMessage());
+    }
+}
+```
+
+---
+
+## Troubleshooting
+
+### 504 Gateway Timeout
+
+**Diagnosis:**
+
+```bash
+# Check task status
+aws ecs describe-services --cluster citicore-cluster --services citicore-auth-service
+
+# Check logs
+aws logs tail /ecs/citicore-auth-service --follow
+
+# Check ALB target health
+aws elbv2 describe-target-health --target-group-arn arn:...
+```
+
+**Solutions:**
+
+```
+1. Increase startup time (startPeriod: 60)
+2. Increase memory (2048 MB minimum)
+3. Increase CPU (1024 minimum)
+4. Check Config Server reachable
+5. Check Eureka reachable
+6. Check RDS reachable
+```
+
+### 401 Unauthorized
+
+**Diagnosis:**
+
+```bash
+# Token invalid - verify token
+curl -X POST http://auth-service:8085/api/v1/auth/validate \
+  -H "Content-Type: application/json" \
+  -d '{"token": "..."}'
+
+# Check token expiration
+jq -R 'split(".") | .[1] | @base64d | fromjson' <<< "token"
+```
+
+**Solutions:**
+
+```
+1. Token expired → Request new token with refresh token
+2. Token tampered → Invalid signature, re-login
+3. Token blacklisted → User logged out, re-login
+4. Wrong secret key → Check JWT_SECRET in Secrets Manager
+```
+
+### 409 Conflict (Duplicate User)
+
+**Diagnosis:**
+
+```bash
+# Check if user already exists
+mysql -h <rds-endpoint> -u admin -p
+
+SELECT email FROM users WHERE email = 'test@example.com';
+```
+
+**Solutions:**
+
+```
+1. Use different email address
+2. If lost password: Use password reset endpoint
+3. If account locked: Admin unlock required
+```
+
+---
+
+## Interview-Ready Decisions
+
+### Decision 1: Why Separate Auth Service?
+
+**Context:**
+
+Could have integrated authentication logic into each microservice.
+
+**Decision:**
+
+Created dedicated Auth Service.
+
+**Why:**
+
+```
+Centralized Authentication:
+├─ Single point of policy enforcement
+├─ Easier to audit and secure
+├─ Prevents inconsistency bugs
+├─ Simplified token validation logic
+
+Scalability:
+├─ Auth Service scales independently
+├─ Other services don't handle auth
+├─ Can add Redis caching layer
+├─ Can add rate limiting
+
+Compliance:
+├─ Banking regulations require audit trails
+├─ Centralized logging easier to achieve
+├─ Single source of truth for user roles
+└─ Simpler to demonstrate controls
+```
+
+**Interview Response:**
+
+"I separated authentication into a dedicated microservice because authentication is a cross-cutting concern in a distributed system. If every service implemented its own auth, we'd have inconsistent policies, duplicate logic, and increased attack surface. A centralized Auth Service provides a single point of policy enforcement and audit. For banking, where regulatory compliance matters, this isolation is critical—we can demonstrate that all authentication decisions flow through one auditable component."
+
+---
+
+### Decision 2: Why JWT Over Session Cookies?
+
+**Context:**
+
+Could have used traditional session-based authentication.
+
+**Decision:**
+
+JWT for microservices, cookies for web apps.
+
+**Why:**
+
+```
+JWT Advantages for Microservices:
+├─ Stateless: Each service validates independently
+├─ No session replication needed
+├─ Horizontal scaling simplified
+├─ Better for mobile/API clients
+
+Session Cookies Limitations:
+├─ Requires sticky sessions (no true scaling)
+├─ Service-to-service calls harder
+├─ Session replication overhead
+├─ Less suitable for distributed systems
+```
+
+**Interview Response:**
+
+"JWT is the right choice for microservices because it's stateless. Each service can independently validate a JWT without calling Auth Service every time. This scales better than session cookies, which require sticky sessions and session replication. For a distributed banking system, JWT's stateless nature enables true horizontal scaling—we can add Account Service instances without worrying about session affinity."
+
+---
+
+### Decision 3: Why Redis for Token Caching?
+
+**Context:**
+
+Could store all tokens in RDS database only.
+
+**Decision:**
+
+Cache tokens in Redis for validation, store long-term state in RDS.
+
+**Why:**
+
+```
+Token Validation Pattern:
+├─ Incoming request has JWT
+├─ Validate signature (no I/O needed)
+├─ Check in Redis cache first (fast)
+│  ├─ If in cache and valid → Allow
+│  ├─ If not in cache → Query RDS
+│  └─ If blacklisted in Redis → Deny
+├─ Result: ~90% of validations hit Redis
+├─ RDS queries: ~10% only
+
+Performance Impact:
+├─ Redis: ~1ms latency
+├─ RDS: ~10-20ms latency
+├─ 10x faster for cache hits
+└─ Reduces RDS load significantly
+```
+
+**Interview Response:**
+
+"I use Redis as a cache for token validation to optimize latency. On every incoming request to protected endpoints, we validate the JWT. If we hit RDS every time, we'd overwhelm the database. Redis gives us sub-millisecond validation for most requests. We still use RDS for user data and long-term state, but token caching in Redis is the performance optimization that makes JWT practical at scale."
+
+---
+
+### Decision 4: Why 15-minute Access Tokens + 7-day Refresh Tokens?
+
+**Context:**
+
+Could use longer-lived single tokens or different durations.
+
+**Decision:**
+
+15-minute access tokens, 7-day refresh tokens.
+
+**Why:**
+
+```
+Access Token (15 minutes):
+├─ Short-lived → Minimizes breach window
+├─ If compromised, valid for only 15 min
+├─ Forces periodic refresh (keeps session active)
+├─ User experience: Refresh happens in background
+
+Refresh Token (7 days):
+├─ Longer-lived → Reduces re-login frequency
+├─ Stored securely (server-side, can revoke)
+├─ Can be blacklisted on logout
+├─ Enables "remember me" functionality
+
+Risk/Convenience Balance:
+├─ All-tokens-15min: Frequent re-login (poor UX)
+├─ All-tokens-7day: Long breach window (security risk)
+├─ Dual approach: Best of both
+```
+
+**Interview Response:**
+
+"The access token/refresh token split optimizes both security and user experience. A compromised access token is only valid for 15 minutes—the attacker has a tight window. But the user doesn't have to re-authenticate every 15 minutes; the client refreshes the access token automatically using the longer-lived refresh token. This is standard in OAuth2 for exactly this reason. It's a practical compromise between the security of short-lived tokens and the UX of not forcing re-authentication constantly."
+
+---
+
+## Summary: 9 Issues Resolved
+
+```
+✅ Issue #1: Spring Cloud/Boot version mismatch (504 timeout)
+   Solution: Aligned to Spring Boot 3.2.4, Cloud 2023.0.3
+
+✅ Issue #2: Eureka registration failure
+   Solution: Configured bootstrap.yml with Eureka endpoint
+
+✅ Issue #3: Config Server bootstrap failure
+   Solution: Added Config Server configuration to bootstrap.yml
+
+✅ Issue #4: RDS connection timeout
+   Solution: Added security group rule, configured JDBC URL with TLS
+
+✅ Issue #5: JWT secret not configured
+   Solution: Created secret in AWS Secrets Manager, provided via environment
+
+✅ Issue #6: ALB health check failing
+   Solution: Updated health check path to /actuator/health, increased startPeriod
+
+✅ Issue #7: Insufficient ECS task resources
+   Solution: Increased CPU to 1024, Memory to 2048
+
+✅ Issue #8: Kafka events dependency missing
+   Solution: Built and installed kafka-events locally
+
+✅ Issue #9: Security groups blocking traffic
+   Solution: Added outbound rules for Eureka, Config Server, RDS, Kafka
+
+Result: Auth Service returns 200/201 for API calls (not 504)
+```
+
+---
+
+## Production Deployment Checklist
+
+```
+Pre-Deployment
+☐ All 9 issues resolved
+☐ Local build passes (mvn clean package)
+☐ Docker image builds locally
+☐ Health endpoint returns 200 OK
+☐ JWT generation works
+☐ Database schema initialized
+☐ Secrets created in Secrets Manager
+
+Deployment
+☐ Docker image pushed to ECR
+☐ Task definition created in ECS
+☐ Service created in ECS cluster
+☐ ALB target group configured
+☐ ALB listeners configured
+☐ Security groups configured correctly
+
+Post-Deployment
+☐ Task is RUNNING (not PROVISIONING)
+☐ Health check PASSING
+☐ Task appears in Eureka registry
+☐ Config fetched from Config Server
+☐ Can call /actuator/health → 200
+☐ Can POST /api/v1/auth/register → 201
+☐ Can POST /api/v1/auth/login → 200
+☐ JWT token generated correctly
+☐ Other services can validate token
+☐ Load test successful (no timeouts)
+
+Monitoring
+☐ CloudWatch alarms configured
+☐ Error rate < 1%
+☐ Latency p99 < 500ms
+☐ No memory leaks
+☐ No connection pool exhaustion
+```
+
+---
+
+
