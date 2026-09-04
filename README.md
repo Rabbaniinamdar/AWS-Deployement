@@ -9710,3 +9710,2001 @@ Layer-by-layer debugging was essential: tested at application level, container l
 ```
 
 ---
+# CitiCore Account Service
+
+**A production-grade Spring Boot microservice for banking operations with AWS RDS Primary/Replica architecture, dynamic read/write routing, MySQL partitioning, and event-driven patterns.**
+
+## Table of Contents
+
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+3. [Database Architecture](#database-architecture)
+4. [RDS Primary and Replica](#rds-primary-and-replica)
+5. [TLS/SSL Configuration](#tlsssl-configuration)
+6. [DataSource Routing](#datasource-routing)
+7. [Connection Pooling](#connection-pooling)
+8. [MySQL Partitioning](#mysql-partitioning)
+9. [Real Issues & Solutions](#real-issues--solutions)
+10. [Transactional Outbox Pattern](#transactional-outbox-pattern)
+11. [Configuration](#configuration)
+12. [Deployment](#deployment)
+13. [Troubleshooting](#troubleshooting)
+14. [Best Practices](#best-practices)
+15. [Interview Ready: Key Decisions](#interview-ready-key-decisions)
+
+---
+
+## Overview
+
+The CitiCore Account Service manages account operations in a banking platform. The implementation addresses critical production requirements:
+
+- **Scalability**: Read replicas for read-heavy workloads without increasing primary load
+- **Consistency**: Strong reads for banking-critical operations; eventual consistency for non-critical reads
+- **Reliability**: Automatic failover from replica to primary; replica health monitoring
+- **Durability**: Transactional Outbox pattern for reliable event publishing to Kafka
+- **Security**: TLS 1.3 with certificate validation; separate read-only database users
+- **Performance**: HikariCP connection pooling; MySQL table partitioning for high-volume tables
+
+```
+Client Request
+       |
+       v
+Spring Boot Controller
+       |
+       v
+Service Layer (@ReadOnly / @PrimaryRead / @Transactional)
+       |
+       v
+AOP Routing Aspect
+       |
+       +---> Set ThreadLocal context (PRIMARY / REPLICA)
+       |
+       v
+AbstractRoutingDataSource
+       |
+       +---> Check Replica Health
+       |
+       +---> REPLICA available? → REPLICA : PRIMARY
+       |
+       v
+HikariCP Connection Pool
+       |
+       v
+AWS RDS (Primary or Replica)
+```
+
+---
+
+## Architecture
+
+### High-Level Component Diagram
+
+```
+┌─────────────────────────────────────────┐
+│        API Gateway / Clients            │
+└────────────────┬────────────────────────┘
+                 │
+┌────────────────v────────────────────────┐
+│     Account Service (Spring Boot)       │
+│  ┌──────────────────────────────────┐  │
+│  │  Service Layer                   │  │
+│  │  - Accounts                      │  │
+│  │  - Statements                    │  │
+│  │  - Transfers                     │  │
+│  └──────────────┬───────────────────┘  │
+│                 │                       │
+│  ┌──────────────v───────────────────┐  │
+│  │  AOP Routing Aspect              │  │
+│  │  @Order(1) - Executes first      │  │
+│  │  @ReadOnly → REPLICA             │  │
+│  │  @PrimaryRead → PRIMARY          │  │
+│  │  Default → PRIMARY (safe)        │  │
+│  └──────────────┬───────────────────┘  │
+│                 │                       │
+│  ┌──────────────v───────────────────┐  │
+│  │  AbstractRoutingDataSource       │  │
+│  │  - Checks Replica Health         │  │
+│  │  - Routes to PRIMARY/REPLICA     │  │
+│  └──────────┬───────────┬───────────┘  │
+│             │           │               │
+└─────────────┼───────────┼───────────────┘
+              │           │
+   ┌──────────v─┐    ┌────v──────────┐
+   │Primary Pool│    │ Replica Pool  │
+   │ HikariCP   │    │  HikariCP     │
+   │ (10 conns) │    │ (20 conns)    │
+   └──────────┬─┘    └────┬──────────┘
+              │           │
+   ┌──────────v─────────────v──────────┐
+   │  AWS RDS MySQL Endpoints           │
+   │  ┌─────────────┐  ┌────────────┐  │
+   │  │  Primary    │→ │  Replica   │  │
+   │  │ Read/Write  │  │    Read    │  │
+   │  └─────────────┘  └────────────┘  │
+   └────────────────────────────────────┘
+```
+
+### Event Flow: Write Operation
+
+```
+POST /accounts/{id}/debit
+         |
+         v
+    @Transactional
+         |
+    ┌────v────┐
+    │ PRIMARY │
+    └────┬────┘
+         |
+    ┌────┴─────────────────────┐
+    │                           │
+    v                           v
+Update Account         Insert Outbox Event
+Balance                (status=PENDING)
+    │                           │
+    └────┬─────────────────────┘
+         │
+   COMMIT (Both or Nothing)
+         |
+         v
+Outbox Publisher
+    (separate thread/service)
+         |
+    ┌────v────┐
+    │ Kafka   │
+    └────┬────┘
+         |
+  ┌──────┴──────┐
+  │             │
+  v             v
+SUCCESS    FAILURE
+status=SENT status=FAILED
+         |
+      RETRY
+         |
+         v
+       DLQ
+```
+
+---
+
+## Database Architecture
+
+### Conceptual Model
+
+```
+citicore_account (schema)
+     |
+     ├── accounts (not partitioned)
+     │   └── One row per account
+     │       (small, stable table)
+     │
+     ├── account_statements (RANGE partitioned by created_at)
+     │   ├── p_2026_01  (Jan 2026)
+     │   ├── p_2026_02  (Feb 2026)
+     │   ├── ...
+     │   ├── p_2026_12  (Dec 2026)
+     │   └── p_future   (MAXVALUE)
+     │   └── Monthly partitions reduce query scope
+     │
+     ├── account_outbox (RANGE partitioned by created_at)
+     │   ├── p_2026_01
+     │   ├── ...
+     │   └── p_future
+     │   └── Short-lived events; efficient cleanup
+     │
+     ├── dead_letter_events (not partitioned)
+     │   └── Operational/admin table; remains small
+     │
+     └── account_sequence
+         └── Sequence table for ID generation
+```
+
+### Table Schemas
+
+#### accounts
+
+```sql
+CREATE TABLE accounts (
+    id BIGINT PRIMARY KEY,
+    account_number VARCHAR(20) UNIQUE NOT NULL,
+    account_holder_name VARCHAR(255),
+    account_type ENUM('SAVINGS', 'CURRENT'),
+    balance DECIMAL(15, 2),
+    status ENUM('ACTIVE', 'CLOSED', 'FROZEN'),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_account_number (account_number),
+    INDEX idx_status (status)
+);
+```
+
+#### account_statements (Partitioned)
+
+```sql
+CREATE TABLE account_statements (
+    id BIGINT,
+    created_at DATETIME NOT NULL,
+    account_number VARCHAR(20) NOT NULL,
+    txn_ref VARCHAR(50),
+    transaction_type ENUM('DEBIT', 'CREDIT', 'REVERSAL'),
+    amount DECIMAL(15, 2),
+    balance_after_txn DECIMAL(15, 2),
+    description VARCHAR(500),
+    
+    PRIMARY KEY (id, created_at),
+    UNIQUE KEY uk_txn_ref (txn_ref, created_at),
+    INDEX idx_account_date (account_number, created_at)
+    
+) PARTITION BY RANGE COLUMNS(created_at) (
+    PARTITION p_2026_01 VALUES LESS THAN ('2026-02-01'),
+    PARTITION p_2026_02 VALUES LESS THAN ('2026-03-01'),
+    ...
+    PARTITION p_2026_12 VALUES LESS THAN ('2027-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+#### account_outbox (Partitioned)
+
+```sql
+CREATE TABLE account_outbox (
+    id BIGINT,
+    created_at DATETIME NOT NULL,
+    event_id VARCHAR(50) UNIQUE NOT NULL,
+    account_number VARCHAR(20),
+    topic VARCHAR(100),
+    payload JSON,
+    status ENUM('PENDING', 'SENT', 'FAILED'),
+    retry_count INT DEFAULT 0,
+    
+    PRIMARY KEY (id, created_at),
+    UNIQUE KEY uk_event_id (event_id, created_at),
+    INDEX idx_status_date (status, created_at)
+    
+) PARTITION BY RANGE COLUMNS(created_at) (
+    PARTITION p_2026_01 VALUES LESS THAN ('2026-02-01'),
+    ...
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+---
+
+## RDS Primary and Replica
+
+### What is Replication?
+
+MySQL asynchronous replication creates a copy of the primary database on a separate server (replica). Changes on the primary are read from the binary log and replayed on the replica.
+
+```
+Primary (Source)                  Replica (Target)
+┌─────────────────┐              ┌─────────────────┐
+│ Transaction     │              │                 │
+│ 1. Debit ₹1000  │              │ [async lag]     │
+│ COMMIT          │ Binary Log   │                 │
+│                 │─────────────>│ Apply changes   │
+│ Balance: ₹9000  │ (delayed)    │ Balance: ₹9000  │
+└─────────────────┘              └─────────────────┘
+
+KEY POINT: Replica lag is unpredictable.
+```
+
+### Why Use Replica?
+
+For a read-heavy application like banking:
+
+- Primary handles ~20% of traffic (writes + critical reads)
+- Replica handles ~80% of traffic (non-critical reads)
+
+This prevents read volume from overwhelming the primary.
+
+### Responsibilities
+
+| Operation | Primary | Replica |
+|-----------|---------|---------|
+| INSERT | ✅ | ❌ |
+| UPDATE | ✅ | ❌ |
+| DELETE | ✅ | ❌ |
+| SELECT (account balance) | ✅ | ❌ (stale) |
+| SELECT (statement history) | ✅ | ✅ (acceptable lag) |
+| SELECT (account list) | ✅ | ✅ (acceptable lag) |
+
+---
+
+## TLS/SSL Configuration
+
+### The Problem: Why We Need TLS
+
+Without TLS, database traffic travels unencrypted:
+
+```
+Application                     AWS RDS
+     │                              │
+     │  SELECT * FROM accounts      │
+     ├─────────────────────────────>│
+     │  [visible on network]         │
+     │                              │
+     │  account_number: CITI123456   │
+     │<─────────────────────────────┤
+     │  balance: ₹50,000             │
+     │  [exposed!]                   │
+```
+
+### The Solution: TLS 1.3 with VERIFY_IDENTITY
+
+```
+Application                     AWS RDS
+     │                              │
+     │  TLS Handshake               │
+     │  - Authenticate RDS          │
+     │  - Verify hostname           │
+     │  - Establish encryption key  │
+     ├────────────TLS────────────>│
+     │                              │
+     │  [encrypted] SELECT query    │
+     ├─────────────────────────────>│
+     │  [encrypted] SELECT result   │
+     │<─────────────────────────────┤
+     │  [only readable with key]     │
+```
+
+### Configuration: JDBC URL
+
+```yaml
+# Development (NOT production)
+jdbc-url: jdbc:mysql://localhost:3306/db?useSSL=false
+
+# Production (AWS RDS)
+jdbc-url: jdbc:mysql://rds-endpoint.aws.com:3306/db?sslMode=VERIFY_IDENTITY&serverTimezone=UTC
+```
+
+### Why VERIFY_IDENTITY?
+
+Three levels exist:
+
+| Mode | Encryption | CA Validation | Hostname Check |
+|------|-----------|--------------|-----------------|
+| `useSSL=false` | ❌ | ❌ | ❌ |
+| `sslMode=VERIFY_CA` | ✅ | ✅ | ❌ |
+| `sslMode=VERIFY_IDENTITY` | ✅ | ✅ | ✅ |
+
+`VERIFY_IDENTITY` protects against man-in-the-middle attacks by verifying the server's hostname matches the certificate.
+
+### Real Issue #1: Java Truststore Not Trusted
+
+**Error Encountered:**
+
+```
+com.mysql.cj.exceptions.CommunicationsException:
+Communications link failure
+The last packet successfully received from the server was ...
+
+Caused by: javax.net.ssl.SSLHandshakeException: 
+PKIX path building failed: sun.security.provider.certpath.SunCertPathBuilderException:
+unable to find valid certification path to requested target
+```
+
+**Root Cause:**
+
+The JVM didn't have AWS RDS CA in its trusted certificate store.
+
+**Solution:**
+
+1. Download AWS RDS CA bundle:
+
+```bash
+# From AWS docs: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html
+wget https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+```
+
+2. Create Java truststore:
+
+```bash
+keytool -import -alias rds-ca \
+  -file global-bundle.pem \
+  -keystore rds-truststore.jks \
+  -storepass changeit \
+  -noprompt
+```
+
+3. Verify truststore:
+
+```bash
+keytool -list -keystore rds-truststore.jks -storepass changeit
+# Output: rds-ca, trustedCertEntry
+```
+
+4. Configure JVM (IntelliJ):
+
+Go to **Run > Edit Configurations > VM Options** and add:
+
+```
+-Djavax.net.ssl.trustStore=/path/to/rds-truststore.jks
+-Djavax.net.ssl.trustStorePassword=changeit
+-Djavax.net.ssl.trustStoreType=PKCS12
+```
+
+Or via PowerShell:
+
+```powershell
+$env:JAVA_TOOL_OPTIONS="-Djavax.net.ssl.trustStore=$PWD/src/main/resources/rds-truststore.jks -Djavax.net.ssl.trustStorePassword=changeit"
+```
+
+5. Verify TLS connection (MySQL CLI):
+
+```bash
+mysql -h rds-endpoint.amazonaws.com \
+  -u admin -p \
+  --ssl-mode=VERIFY_IDENTITY \
+  --ssl-ca=global-bundle.pem \
+  -e "SHOW STATUS LIKE 'Ssl_version';"
+
+# Output: Ssl_version | TLSv1.3
+```
+
+---
+
+## DataSource Routing
+
+### The Challenge: Multiple Databases, One Application
+
+The Account Service needs to route database operations to different endpoints:
+
+- **Writes** → Primary (authoritative)
+- **Critical reads** → Primary (require latest state)
+- **Non-critical reads** → Replica (acceptable lag)
+
+### How It Works
+
+#### 1. ThreadLocal Context
+
+```java
+public class DataSourceContextHolder {
+    private static final ThreadLocal<DataSourceType> CONTEXT = 
+        new ThreadLocal<>();
+
+    public static void setDataSourceType(DataSourceType type) {
+        CONTEXT.set(type);
+    }
+
+    public static DataSourceType getDataSourceType() {
+        return CONTEXT.getOrElse(DataSourceType.PRIMARY); // Safe default
+    }
+
+    public static void clear() {
+        CONTEXT.remove(); // CRITICAL: must be called in finally
+    }
+}
+
+public enum DataSourceType {
+    PRIMARY, REPLICA
+}
+```
+
+**Why ThreadLocal?**
+
+- Each HTTP request runs on an application thread
+- Routing decision must belong to that specific request/thread
+- Prevents one request's routing from affecting another
+- **CRITICAL**: Application servers (Tomcat) reuse threads, so context must be cleared after every request
+
+#### 2. RoutingDataSource
+
+```java
+@Configuration
+public class DataSourceConfig {
+    
+    @Bean("primaryDataSource")
+    @ConfigurationProperties(prefix = "spring.datasource.primary")
+    public HikariDataSource primaryDataSource() {
+        HikariDataSource ds = new HikariDataSource();
+        ds.setPoolName("CitiCore-Primary-Pool");
+        ds.setMaximumPoolSize(10);
+        ds.setMinimumIdle(3);
+        ds.setConnectionTimeout(30_000);
+        return ds;
+    }
+
+    @Bean("replicaDataSource")
+    @ConfigurationProperties(prefix = "spring.datasource.replica")
+    public HikariDataSource replicaDataSource() {
+        HikariDataSource ds = new HikariDataSource();
+        ds.setPoolName("CitiCore-Replica-Pool");
+        ds.setMaximumPoolSize(20);
+        ds.setMinimumIdle(5);
+        ds.setConnectionTimeout(3_000);
+        return ds;
+    }
+
+    @Bean
+    @Primary
+    public DataSource routingDataSource(
+            @Qualifier("primaryDataSource") DataSource primary,
+            @Qualifier("replicaDataSource") DataSource replica) {
+        
+        Map<Object, Object> targetDataSources = new HashMap<>();
+        targetDataSources.put(DataSourceType.PRIMARY, primary);
+        targetDataSources.put(DataSourceType.REPLICA, replica);
+
+        RoutingDataSource routing = new RoutingDataSource();
+        routing.setTargetDataSources(targetDataSources);
+        routing.setDefaultTargetDataSource(primary); // Safe default
+        return routing;
+    }
+}
+
+public class RoutingDataSource extends AbstractRoutingDataSource {
+    
+    @Override
+    protected Object determineCurrentLookupKey() {
+        DataSourceType type = DataSourceContextHolder.getDataSourceType();
+        
+        // Check replica health before returning REPLICA
+        if (type == DataSourceType.REPLICA && !isReplicaHealthy()) {
+            DataSourceContextHolder.setDataSourceType(DataSourceType.PRIMARY);
+            return DataSourceType.PRIMARY;
+        }
+        
+        return type;
+    }
+    
+    private boolean isReplicaHealthy() {
+        return replicaHealthIndicator.isHealthy();
+    }
+}
+```
+
+#### 3. AOP-Based Routing
+
+```java
+@Aspect
+@Component
+@Order(1) // Execute BEFORE @Transactional
+public class ReadOnlyDataSourceAspect {
+    
+    @Around("@annotation(ReadOnly)")
+    public Object handleReadOnly(ProceedingJoinPoint joinPoint) 
+            throws Throwable {
+        DataSourceContextHolder.setDataSourceType(DataSourceType.REPLICA);
+        try {
+            return joinPoint.proceed();
+        } finally {
+            DataSourceContextHolder.clear(); // CRITICAL
+        }
+    }
+
+    @Around("@annotation(PrimaryRead)")
+    public Object handlePrimaryRead(ProceedingJoinPoint joinPoint) 
+            throws Throwable {
+        DataSourceContextHolder.setDataSourceType(DataSourceType.PRIMARY);
+        try {
+            return joinPoint.proceed();
+        } finally {
+            DataSourceContextHolder.clear(); // CRITICAL
+        }
+    }
+}
+
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface ReadOnly { }
+
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface PrimaryRead { }
+```
+
+#### 4. Service Layer Usage
+
+```java
+@Service
+public class AccountService {
+    
+    // Uses PRIMARY (default)
+    @Transactional
+    public void debitAccount(String accountNumber, BigDecimal amount) {
+        Account account = accountRepository.findByNumber(accountNumber);
+        account.debit(amount);
+        accountRepository.save(account);
+        
+        outboxRepository.save(new OutboxEvent(
+            topic = "debit-success-topic",
+            payload = json(...)
+        ));
+    }
+    
+    // Uses REPLICA (acceptable lag)
+    @ReadOnly
+    public List<AccountStatement> getStatements(String accountNumber) {
+        return statementRepository.findByAccountNumber(accountNumber);
+    }
+    
+    // Uses PRIMARY (requires latest state)
+    @PrimaryRead
+    @Transactional(readOnly = true)
+    public BigDecimal getBalance(String accountNumber) {
+        Account account = accountRepository.findByNumber(accountNumber);
+        return account.getBalance();
+    }
+}
+```
+
+### Real Issue #2: Public Key Retrieval
+
+**Error Encountered:**
+
+```
+com.mysql.cj.exceptions.CommunicationsException:
+Communications link failure
+
+Caused by: javax.net.ssl.SSLHandshakeException:
+Cannot parse server certificate: javax.security.cert.CertificateException:
+No X.509 certificate found in certificate_chain file
+
+Caused by: com.mysql.cj.jdbc.exceptions.CommunicationsException:
+Public Key Retrieval is not allowed
+```
+
+**Root Cause:**
+
+MySQL 8.0+ uses `caching_sha2_password` plugin which requires the public key to authenticate. By default, this is disabled for security.
+
+**Solution:**
+
+Add to JDBC URL:
+
+```yaml
+jdbc-url: jdbc:mysql://rds-endpoint:3306/db?allowPublicKeyRetrieval=true&sslMode=VERIFY_IDENTITY
+```
+
+**Note:** This is acceptable for development. For production, use proper credential management and consider using `mysql_native_password` plugin if your security policy allows.
+
+---
+
+## Connection Pooling
+
+### The Problem: Creating Connections Is Expensive
+
+```
+Without Pooling (SLOW)           With HikariCP (FAST)
+─────────────────────             ──────────────────
+Request                          Request
+  │                                │
+  v                                v
+Create Connection            HikariCP Pool
+(establish TCP, auth,    (reuse existing connection)
+ negotiate SSL/TLS)              │
+  │                              v
+  v                          Execute Query
+Execute Query                     │
+  │                              v
+  v                          Return connection
+Close Connection                to pool
+  │
+WAIT for next
+request
+```
+
+### HikariCP Configuration
+
+```yaml
+spring:
+  datasource:
+    primary:
+      # Connection string
+      jdbc-url: jdbc:mysql://...
+      username: admin
+      password: ${DB_PASSWORD}
+      
+      # Pool sizing
+      hikari:
+        maximum-pool-size: 10      # Max concurrent connections
+        minimum-idle: 3            # Keep idle connections ready
+        
+        # Connection lifecycle
+        connection-timeout: 30000  # Wait max 30s for connection
+        idle-timeout: 600000       # Close idle after 10m
+        max-lifetime: 1800000      # Recycle connection after 30m
+        
+        # Health checks
+        connection-test-query: SELECT 1
+        keepalive-time: 60000      # Send keepalive every 1m
+        
+        pool-name: CitiCore-Primary-Pool
+        
+    replica:
+      hikari:
+        maximum-pool-size: 20      # Larger pool for reads
+        minimum-idle: 5
+        connection-timeout: 3000   # Shorter timeout for replica
+```
+
+### Why Different Sizes?
+
+```
+Primary Pool: 10 connections
+- Handles writes (transactional, less volume)
+- Handles critical reads (balance, validation)
+- Conservative to protect primary
+
+Replica Pool: 20 connections
+- Handles non-critical reads (most traffic)
+- Can afford more connections since replica is less critical
+```
+
+### Monitoring Connection Pool
+
+```java
+@RestController
+public class HealthController {
+    
+    @GetMapping("/actuator/health/hikari")
+    public Map<String, Object> hikariHealth(HikariDataSource dataSource) {
+        return Map.of(
+            "poolSize", dataSource.getHikariPoolMXBean().getActiveConnections(),
+            "idleConnections", dataSource.getHikariPoolMXBean().getIdleConnections(),
+            "totalConnections", dataSource.getHikariPoolMXBean().getTotalConnections(),
+            "waitingQueueSize", dataSource.getHikariPoolMXBean().getWaitingQueueSize()
+        );
+    }
+}
+```
+
+---
+
+## MySQL Partitioning
+
+### Why Partition?
+
+For `account_statements`, rows accumulate rapidly:
+
+```
+Each transaction creates a record.
+Bank with 1M customers, 10 transactions/day average
+= 10M rows/day
+= 300M rows/month
+= 3.6B rows/year
+
+Without partitioning:
+SELECT * FROM account_statements WHERE account_number = ? AND created_at >= ?
+→ Scans 3.6B rows (slow)
+
+With monthly partitions:
+SELECT * FROM account_statements WHERE account_number = ? AND created_at >= '2026-06-01'
+→ Scans only June's 300M rows (10x faster)
+This is PARTITION PRUNING
+```
+
+### Implementation
+
+```sql
+-- Create partitioned table
+CREATE TABLE account_statements (
+    id BIGINT,
+    created_at DATETIME NOT NULL,
+    account_number VARCHAR(20),
+    amount DECIMAL(15, 2),
+    ...
+    
+    PRIMARY KEY (id, created_at),  -- MUST include partition column
+    UNIQUE KEY uk_txn (txn_ref, created_at)  -- MUST include partition column
+    
+) PARTITION BY RANGE COLUMNS(created_at) (
+    PARTITION p_2026_01 VALUES LESS THAN ('2026-02-01'),
+    PARTITION p_2026_02 VALUES LESS THAN ('2026-03-01'),
+    ...
+    PARTITION p_2026_12 VALUES LESS THAN ('2027-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+### Maintenance: Adding New Partition
+
+```sql
+-- When 2027 arrives, reorganize p_future
+ALTER TABLE account_statements
+REORGANIZE PARTITION p_future INTO (
+    PARTITION p_2027_01 VALUES LESS THAN ('2027-02-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+);
+```
+
+### Maintenance: Dropping Old Data
+
+```sql
+-- Remove old data per retention policy (e.g., keep 2 years)
+ALTER TABLE account_statements
+DROP PARTITION p_2024_01;
+```
+
+This is orders of magnitude faster than `DELETE` because it doesn't touch individual rows.
+
+### Monitoring Partitions
+
+```sql
+SELECT
+    PARTITION_NAME,
+    TABLE_ROWS,
+    ROUND(DATA_LENGTH / 1024 / 1024, 2) AS data_mb
+FROM INFORMATION_SCHEMA.PARTITIONS
+WHERE TABLE_SCHEMA = 'citicore_account'
+AND TABLE_NAME = 'account_statements'
+ORDER BY PARTITION_NAME;
+```
+
+### Verify Partition Pruning
+
+```sql
+EXPLAIN
+SELECT * FROM account_statements
+WHERE account_number = 'CITI000000000001'
+AND created_at >= '2026-06-01'
+AND created_at < '2026-07-01';
+
+-- Look for: 'key' shows partition p_2026_06 only
+```
+
+---
+
+## Real Issues & Solutions
+
+### Issue #1: Docker Command Entered Inside MySQL Prompt
+
+**Scenario:**
+
+```bash
+$ docker exec -it mysql-container mysql -uroot -p
+mysql> docker exec mysql-container ls -l /etc/mysql/conf.d
+```
+
+**Error:**
+
+```
+ERROR 1064 (42000): You have an error in your SQL syntax; check the manual...
+```
+
+**Why:**
+
+The `docker exec` command was entered inside the MySQL prompt, so MySQL tried to parse it as SQL.
+
+**Solution:**
+
+Exit MySQL first:
+
+```bash
+mysql> exit
+
+$ docker exec mysql-container ls -l /etc/mysql/conf.d
+```
+
+**Interview Narrative:**
+
+"During initial Docker setup, I encountered SQL syntax errors while executing Docker commands. This taught me to distinguish between the container environment and the MySQL CLI environment—a lesson in maintaining correct context awareness during infrastructure debugging."
+
+---
+
+### Issue #2: Docker Configuration File Ignored (World-Writable)
+
+**Scenario:**
+
+```bash
+docker run -v /path/to/my.cnf:/etc/mysql/conf.d/my.cnf ...
+```
+
+Both primary and replica reported:
+
+```
+server_id = 1
+gtid_mode = OFF
+```
+
+even though the config file specified `server_id=2` and `gtid_mode=ON`.
+
+**Error:**
+
+```
+World-writable config file '/etc/mysql/conf.d/my.cnf' is ignored.
+```
+
+**Root Cause:**
+
+The config file had permissions `-rwxrwxrwx` (777). MySQL ignores world-writable config files for security.
+
+**Solution:**
+
+```bash
+# On host
+chmod 644 /path/to/my.cnf
+
+# Verify
+ls -l /path/to/my.cnf
+# -rw-r--r-- (644)
+```
+
+**Verification:**
+
+```bash
+docker exec mysql-container mysql -e "SHOW VARIABLES LIKE 'server_id';"
+# server_id | 2  ✅
+```
+
+**Interview Narrative:**
+
+"I discovered that MySQL silently ignores configuration files with incorrect permissions. This was a subtle bug that only became apparent through systematic checking of runtime variables against expected config values—a reminder that configuration isn't always applied as expected, and verification is critical."
+
+---
+
+### Issue #3: RDS Connectivity (Network/Security Groups)
+
+**Scenario:**
+
+```powershell
+Test-NetConnection <RDS_ENDPOINT> -Port 3306
+
+TcpTestSucceeded : False
+```
+
+**Error:**
+
+```
+Can't connect to MySQL server on '<RDS_ENDPOINT>' (110 Connection timed out)
+```
+
+**Root Cause:**
+
+AWS security groups weren't configured to allow inbound traffic on port 3306.
+
+**Solution:**
+
+1. Find the RDS instance's security group
+2. Add inbound rule:
+
+```
+Type: MySQL/Aurora
+Protocol: TCP
+Port: 3306
+Source: <application security group> or <CIDR>
+```
+
+3. Verify:
+
+```powershell
+Test-NetConnection <RDS_ENDPOINT> -Port 3306
+TcpTestSucceeded : True  ✅
+```
+
+**Interview Narrative:**
+
+"Network connectivity issues often appear as application errors. I learned to separate network problems from TLS problems from authentication problems by testing at each layer independently—first checking basic TCP connectivity, then testing TLS specifically, then testing credentials. This layered troubleshooting approach significantly reduced debugging time."
+
+---
+
+### Issue #4: Incorrect Database User Credentials
+
+**Scenario:**
+
+Spring Boot attempted to connect using user `nitis` (developer's machine username):
+
+```
+Access denied for user 'nitis'@'103.172.203.198'
+```
+
+**Verification:**
+
+```sql
+SELECT user, host FROM mysql.user WHERE user = 'nitis';
+-- Empty set (user doesn't exist)
+```
+
+**Solution:**
+
+Create dedicated application users:
+
+```sql
+-- For primary (write operations)
+CREATE USER 'app_primary'@'%' IDENTIFIED BY 'strong_password';
+GRANT ALL PRIVILEGES ON citicore_account.* TO 'app_primary'@'%';
+
+-- For replica (read-only)
+CREATE USER 'app_replica'@'%' IDENTIFIED BY 'strong_password';
+GRANT SELECT ON citicore_account.* TO 'app_replica'@'%';
+
+FLUSH PRIVILEGES;
+```
+
+Update configuration:
+
+```yaml
+spring:
+  datasource:
+    primary:
+      username: app_primary
+      password: ${DB_PRIMARY_PASSWORD}
+    replica:
+      username: app_replica
+      password: ${DB_REPLICA_PASSWORD}
+```
+
+**Interview Narrative:**
+
+"Initial development used Windows usernames directly for database access. Moving to production required dedicated service accounts with least-privilege permissions. This highlighted the importance of maintaining environment-specific configurations and never assuming development credentials work in other environments."
+
+---
+
+### Issue #5: Hibernatealidation - Enum Type Mismatch
+
+**Scenario:**
+
+```java
+@Entity
+@Table(name = "account_outbox")
+public class AccountOutboxEvent {
+    @Enumerated(EnumType.STRING)
+    private OutboxStatus status;  // Java ENUM
+}
+```
+
+Application startup failed:
+
+```
+org.hibernate.HibernateException: Wrong column type in database.
+Found: varchar(20), expected: varchar(255)
+```
+
+**Root Cause:**
+
+Database column was defined as `VARCHAR(20)` but Hibernate expected `VARCHAR(255)`.
+
+**Verification:**
+
+```sql
+SHOW CREATE TABLE account_outbox\G
+
+-- Or
+
+SELECT COLUMN_TYPE FROM information_schema.columns
+WHERE table_schema = 'citicore_account'
+AND table_name = 'account_outbox'
+AND column_name = 'status';
+-- varchar(20)
+```
+
+**Solution:**
+
+Explicitly define column type in entity:
+
+```java
+@Enumerated(EnumType.STRING)
+@Column(
+    name = "status",
+    nullable = false,
+    columnDefinition = "VARCHAR(20)"
+)
+private OutboxStatus status;
+```
+
+Change Hibernate to `validate` mode (don't auto-fix):
+
+```yaml
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate  # Just check, don't modify
+```
+
+**Interview Narrative:**
+
+"Hibernate's schema validation caught a subtle mismatch between entity annotations and actual database schema. Initially, I considered having Hibernate auto-correct (ddl-auto: update), but for production banking applications, automatic schema modifications are dangerous. Instead, I configured Hibernate to validate but fail on mismatch, ensuring schema changes go through controlled migrations, not automatic updates."
+
+---
+
+### Issue #6: CREATE TABLE IF NOT EXISTS Doesn't Update
+
+**Scenario:**
+
+Modified `schema.sql` to change table structure. Restarted application expecting changes to apply.
+
+```sql
+-- schema.sql
+CREATE TABLE IF NOT EXISTS account_statements (
+    id BIGINT,
+    created_at DATETIME,
+    amount DECIMAL(15, 2),
+    -- ... new columns
+)
+```
+
+Changes didn't apply.
+
+**Root Cause:**
+
+`CREATE TABLE IF NOT EXISTS` only creates if table doesn't exist. It never modifies an existing table.
+
+**Solution:**
+
+Use explicit migrations (Flyway/Liquibase):
+
+```sql
+-- db/migration/V001__create_account_statements.sql
+CREATE TABLE account_statements (...);
+
+-- db/migration/V002__add_status_to_statements.sql
+ALTER TABLE account_statements ADD COLUMN status VARCHAR(20);
+```
+
+Or manually in RDS:
+
+```sql
+ALTER TABLE account_statements ADD COLUMN new_col VARCHAR(20);
+```
+
+Disable automatic schema init:
+
+```yaml
+spring:
+  sql:
+    init:
+      mode: never  # Don't auto-execute schema.sql
+  jpa:
+    hibernate:
+      ddl-auto: validate  # Just validate, don't modify
+```
+
+**Interview Narrative:**
+
+"This was a critical lesson about production database management. I initially thought `schema.sql` would be sufficient, but learned that it's only suitable for initial setup. For evolving schemas in production, explicit, version-controlled migrations (Flyway) are essential. This prevents accidental data loss and provides rollback capabilities."
+
+---
+
+## Transactional Outbox Pattern
+
+### The Problem: Database and Kafka Synchronization
+
+Without Outbox pattern:
+
+```
+Application                        Kafka
+     │                              │
+     ├─ Update DB                   │
+     │  Account balance ✅          │
+     │                              │
+     └─ Publish event    ─────────>│
+                         (fails)    │
+                                   
+Result: DB updated, but event
+NOT in Kafka. Other services
+don't know about the change!
+```
+
+### The Solution: Transactional Outbox
+
+```
+Application                        Kafka
+     │
+     ├─ BEGIN TRANSACTION
+     │
+     ├─ Update account balance ✅
+     │
+     ├─ Insert outbox record ✅
+     │  status=PENDING
+     │
+     └─ COMMIT ✅
+        Both or nothing!
+        
+        
+Later...
+
+Outbox Publisher              Kafka
+     │                          │
+     ├─ Read PENDING records    │
+     │                          │
+     ├─ Publish to Kafka ─────> │✅
+     │                          │
+     └─ Mark as SENT            │
+```
+
+### Implementation
+
+```java
+@Entity
+@Table(name = "account_outbox")
+public class AccountOutboxEvent {
+    
+    @Id
+    @GeneratedValue
+    private Long id;
+    
+    @Column(unique = true)
+    private String eventId;  // UUID for idempotency
+    
+    private String accountNumber;  // Kafka key for ordering
+    private String topic;
+    
+    @Column(columnDefinition = "JSON")
+    private String payload;  // Raw JSON string
+    
+    @Enumerated(EnumType.STRING)
+    private OutboxStatus status = OutboxStatus.PENDING;
+    
+    private LocalDateTime createdAt;
+    private int retryCount = 0;
+}
+
+public enum OutboxStatus {
+    PENDING,   // Not yet published
+    SENT,      // Successfully published
+    FAILED     // Failed, waiting for retry
+}
+```
+
+### Service Layer
+
+```java
+@Service
+public class AccountService {
+    
+    @Transactional
+    public void debitAccount(String accountNumber, BigDecimal amount) {
+        // Update account
+        Account account = accountRepository.findByNumber(accountNumber);
+        account.debit(amount);
+        accountRepository.save(account);
+        
+        // Insert outbox event IN SAME TRANSACTION
+        AccountOutboxEvent event = new AccountOutboxEvent(
+            eventId = UUID.randomUUID().toString(),
+            accountNumber = accountNumber,
+            topic = "debit-success-topic",
+            payload = "{\"amount\": 1000, \"ref\": \"TXN123\"}",
+            status = OutboxStatus.PENDING,
+            createdAt = LocalDateTime.now()
+        );
+        outboxRepository.save(event);
+        
+        // Both happen or neither happens
+    }
+}
+```
+
+### Outbox Publisher (Separate Service)
+
+```java
+@Component
+public class OutboxPublisher {
+    
+    private final KafkaTemplate<String, String> kafkaTemplate;
+    private final OutboxRepository outboxRepository;
+    
+    @Scheduled(fixedDelay = 5000)  // Every 5 seconds
+    public void publishPendingEvents() {
+        List<AccountOutboxEvent> pending = outboxRepository
+            .findByStatus(OutboxStatus.PENDING);
+            
+        for (AccountOutboxEvent event : pending) {
+            try {
+                // Publish to Kafka
+                kafkaTemplate.send(
+                    event.getTopic(),
+                    event.getAccountNumber(),  // Key (for ordering)
+                    event.getPayload()         // Value
+                ).get(5, TimeUnit.SECONDS);
+                
+                // Mark as sent
+                event.setStatus(OutboxStatus.SENT);
+                outboxRepository.save(event);
+                
+            } catch (Exception e) {
+                event.setRetryCount(event.getRetryCount() + 1);
+                if (event.getRetryCount() >= MAX_RETRIES) {
+                    event.setStatus(OutboxStatus.FAILED);
+                    // TODO: Move to DLQ
+                }
+                outboxRepository.save(event);
+            }
+        }
+    }
+}
+```
+
+---
+
+## Configuration
+
+### Spring Boot Configuration
+
+```yaml
+server:
+  port: 8083
+  servlet:
+    context-path: /api
+
+spring:
+  application:
+    name: account-service
+    
+  # Disable default datasource autoconfiguration
+  # because we have multiple datasources
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+
+  datasource:
+    primary:
+      jdbc-url: jdbc:mysql://citicore-mysql-primary.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com:3306/citicore_account?sslMode=VERIFY_IDENTITY&serverTimezone=UTC
+      username: ${DB_PRIMARY_USER:admin}
+      password: ${DB_PRIMARY_PASSWORD}
+      driver-class-name: com.mysql.cj.jdbc.Driver
+      hikari:
+        maximum-pool-size: 10
+        minimum-idle: 3
+        connection-timeout: 30000
+        idle-timeout: 600000
+        max-lifetime: 1800000
+        pool-name: CitiCore-Primary-Pool
+
+    replica:
+      jdbc-url: jdbc:mysql://citicore-mysql-replica.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com:3306/citicore_account?sslMode=VERIFY_IDENTITY&serverTimezone=UTC
+      username: ${DB_REPLICA_USER:citicore_readonly}
+      password: ${DB_REPLICA_PASSWORD}
+      driver-class-name: com.mysql.cj.jdbc.Driver
+      hikari:
+        maximum-pool-size: 20
+        minimum-idle: 5
+        connection-timeout: 3000
+        idle-timeout: 600000
+        max-lifetime: 1800000
+        pool-name: CitiCore-Replica-Pool
+
+  jpa:
+    hibernate:
+      ddl-auto: validate  # CRITICAL: don't auto-modify production DB
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQL8Dialect
+        format_sql: true
+
+  sql:
+    init:
+      mode: never  # Don't execute schema.sql on startup
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9092}
+    producer:
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      
+  task:
+    scheduling:
+      pool:
+        size: 2
+
+# Application-specific configuration
+citicore:
+  account:
+    min-savings-balance: 1000
+    min-current-balance: 5000
+    outbox:
+      publisher:
+        enabled: true
+        schedule: "*/5 * * * * *"  # Every 5 seconds
+        max-retries: 3
+
+logging:
+  level:
+    com.citicore.account: DEBUG
+    org.springframework.data.jpa: INFO
+    org.springframework.web: INFO
+    org.apache.kafka: WARN
+```
+
+### Environment Variables
+
+```bash
+# Database credentials (use AWS Secrets Manager in production)
+DB_PRIMARY_USER=app_primary
+DB_PRIMARY_PASSWORD=<strong_password>
+DB_REPLICA_USER=app_replica
+DB_REPLICA_PASSWORD=<strong_password>
+
+# Kafka
+KAFKA_BOOTSTRAP=kafka-broker-1:9092,kafka-broker-2:9092
+
+# JVM SSL for RDS
+JAVA_TOOL_OPTIONS="-Djavax.net.ssl.trustStore=/app/rds-truststore.jks -Djavax.net.ssl.trustStorePassword=changeit"
+```
+
+---
+
+## Deployment
+
+### Docker Compose (Development)
+
+```yaml
+version: '3.8'
+
+services:
+  mysql-primary:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: citicore_account
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql-primary-data:/var/lib/mysql
+      - ./mysql-config/primary.cnf:/etc/mysql/conf.d/primary.cnf
+    command: --server-id=1 --log-bin=mysql-bin --gtid-mode=ON --enforce-gtid-consistency
+
+  mysql-replica:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: citicore_account
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-replica-data:/var/lib/mysql
+      - ./mysql-config/replica.cnf:/etc/mysql/conf.d/replica.cnf
+    command: --server-id=2 --relay-log=relay-bin --log-bin=mysql-bin --gtid-mode=ON --read-only --super-read-only
+    depends_on:
+      - mysql-primary
+
+  account-service:
+    build: .
+    ports:
+      - "8083:8083"
+    environment:
+      DB_PRIMARY_PASSWORD: root123
+      DB_REPLICA_PASSWORD: root123
+      JAVA_TOOL_OPTIONS: -Djavax.net.ssl.trustStore=/app/rds-truststore.jks -Djavax.net.ssl.trustStorePassword=changeit
+    volumes:
+      - ./src/main/resources/rds-truststore.jks:/app/rds-truststore.jks
+    depends_on:
+      - mysql-replica
+
+volumes:
+  mysql-primary-data:
+  mysql-replica-data:
+```
+
+### AWS ECS Task Definition (Production)
+
+```json
+{
+  "family": "citicore-account-service",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "containerDefinitions": [
+    {
+      "name": "account-service",
+      "image": "123456789.dkr.ecr.us-east-1.amazonaws.com/citicore-account-service:latest",
+      "portMappings": [
+        {
+          "containerPort": 8083,
+          "hostPort": 8083,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "SPRING_DATASOURCE_PRIMARY_JDBC_URL",
+          "value": "jdbc:mysql://citicore-mysql-primary.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com:3306/citicore_account?sslMode=VERIFY_IDENTITY"
+        },
+        {
+          "name": "SPRING_DATASOURCE_REPLICA_JDBC_URL",
+          "value": "jdbc:mysql://citicore-mysql-replica.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com:3306/citicore_account?sslMode=VERIFY_IDENTITY"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "DB_PRIMARY_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:123456789:secret:db-primary-pass"
+        },
+        {
+          "name": "DB_REPLICA_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:123456789:secret:db-replica-pass"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/citicore-account-service",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8083/actuator/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ],
+  "executionRoleArn": "arn:aws:iam::123456789:role/ecsTaskExecutionRole"
+}
+```
+
+---
+
+## Troubleshooting
+
+### Symptom: Replica Reads Are Slow
+
+**Diagnosis:**
+
+```sql
+SHOW SLAVE STATUS\G
+-- Check Seconds_Behind_Master
+```
+
+**Causes & Solutions:**
+
+1. **Network latency between primary and replica**
+   - Check AWS VPC networking, security groups
+   - Ensure both are in same availability zone if possible
+
+2. **Replica lagging due to heavy write load on primary**
+   - Monitor primary's binary log size
+   - Check replica's relay log
+
+3. **Large transactions blocking replica**
+   - Review transaction logs
+   - Break large transactions into smaller chunks
+
+---
+
+### Symptom: Connection Pool Exhaustion
+
+**Error:**
+
+```
+HikariPool-1 - Exception during pool initialization.
+java.sql.SQLException: Cannot get a connection, pool size: 10, ...
+```
+
+**Causes & Solutions:**
+
+1. **Connection not being returned to pool**
+   - Check for threads not properly cleaned up
+   - Verify ThreadLocal is being cleared in finally blocks
+
+2. **Too many concurrent requests**
+   - Increase pool size (monitor first)
+   - Add request rate limiting
+
+3. **Connection leaks**
+   ```bash
+   # Monitor with JMX or metrics
+   /actuator/metrics/hikaricp.connections.active
+   ```
+
+---
+
+### Symptom: Data Inconsistency Between Primary and Replica
+
+**Scenario:**
+
+Application updated account balance on primary. Immediately reads from replica and gets stale value.
+
+**Solution:**
+
+Use `@PrimaryRead` for consistency-sensitive operations:
+
+```java
+@PrimaryRead  // Don't use replica
+@Transactional(readOnly = true)
+public BigDecimal getBalance(String accountNumber) {
+    return accountRepository.findBalance(accountNumber);
+}
+```
+
+---
+
+### Symptom: Replica Goes Out of Sync
+
+**Error:**
+
+```
+Last_Error: Error 1032; handler error HA_ERR_KEY_NOT_FOUND
+```
+
+**Causes:**
+
+Primary and replica have diverged (e.g., table manually modified on replica).
+
+**Solution:**
+
+Rebuild replica:
+
+```bash
+# Stop replica application
+# Dump primary
+mysqldump -h primary-endpoint -u admin -p citicore_account > backup.sql
+
+# Restore to replica
+mysql -h replica-endpoint -u admin -p citicore_account < backup.sql
+
+# Restart replication
+CHANGE REPLICATION SOURCE TO ...;
+START REPLICA;
+```
+
+---
+
+## Best Practices
+
+### 1. Always Clear ThreadLocal in Finally
+
+```java
+try {
+    DataSourceContextHolder.setDataSourceType(DataSourceType.REPLICA);
+    return proceed();
+} finally {
+    DataSourceContextHolder.clear();  // ALWAYS
+}
+```
+
+### 2. Default to PRIMARY for Safety
+
+```java
+// In DataSourceContextHolder
+public static DataSourceType getDataSourceType() {
+    DataSourceType type = CONTEXT.get();
+    return type != null ? type : DataSourceType.PRIMARY;  // Safe default
+}
+```
+
+### 3. Use Separate Read-Only Database Users
+
+```sql
+-- Primary user (read/write)
+GRANT ALL PRIVILEGES ON citicore_account.* TO 'app_primary'@'%';
+
+-- Replica user (read-only)
+GRANT SELECT ON citicore_account.* TO 'app_replica'@'%';
+```
+
+### 4. Classify Reads Explicitly
+
+| Method | Database | Reason |
+|--------|----------|--------|
+| `getBalance()` | PRIMARY | Stale data dangerous |
+| `getStatements()` | REPLICA | History, lag acceptable |
+| `validateTransfer()` | PRIMARY | Critical consistency |
+| `listAccounts()` | REPLICA | Non-critical list view |
+
+### 5. Use TLS in Production
+
+```yaml
+# Production
+jdbc-url: jdbc:mysql://...?sslMode=VERIFY_IDENTITY
+
+# Never use
+jdbc-url: jdbc:mysql://...?useSSL=false
+```
+
+### 6. Partition High-Volume Tables
+
+```sql
+-- Monthly partitions for 3-4 billion row tables
+PARTITION BY RANGE COLUMNS(created_at)
+
+-- Reduces query scope by ~30x
+-- Makes cleanup efficient (DROP PARTITION vs DELETE millions)
+```
+
+### 7. Monitor Replication Lag
+
+```java
+@Component
+public class ReplicationLagMonitor {
+    
+    @Scheduled(fixedRate = 60000)  // Every minute
+    public void checkLag() {
+        ResultSet rs = template.query("SHOW REPLICA STATUS");
+        long secondsBehind = rs.getLong("Seconds_Behind_Master");
+        
+        if (secondsBehind > 30) {
+            logger.warn("Replica lag: {} seconds", secondsBehind);
+            // Alert operations team
+        }
+    }
+}
+```
+
+### 8. Use Transactional Outbox for Event Reliability
+
+Never:
+```java
+// WRONG: DB and Kafka can become out of sync
+accountRepository.save(account);
+kafkaTemplate.send(event);  // Can fail independently
+```
+
+Always:
+```java
+// RIGHT: Both succeed or both fail
+@Transactional
+public void debit(...) {
+    accountRepository.save(account);
+    outboxRepository.save(event);  // Both in same transaction
+}
+```
+
+### 9. Validate Schema on Startup
+
+```yaml
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate  # Not: create-drop, update
+```
+
+This ensures schema mismatches are caught during deployment, not at runtime.
+
+### 10. Document Read/Write Routing
+
+```java
+/**
+ * Retrieves balance for an account.
+ * 
+ * <p>ROUTING: PRIMARY (not REPLICA)
+ * Reason: Stale balance could lead to overdraft or failed transfers.
+ * Requires consistent read immediately after debit/credit.
+ * 
+ * @param accountNumber
+ * @return current balance
+ */
+@PrimaryRead
+@Transactional(readOnly = true)
+public BigDecimal getBalance(String accountNumber) { ... }
+```
+
+---
+
+## Interview-Ready: Key Decisions
+
+### Decision 1: Why Separate Primary and Replica Pools?
+
+**Context:**
+
+Writes and critical reads go to Primary. Non-critical reads go to Replica.
+
+**Decision:**
+
+Create two separate HikariCP pools with different configurations.
+
+**Why:**
+
+```
+Single pool approach (BAD):
+- 10 connections total
+- 8 consumed by heavy read traffic on replica
+- Write operations starve waiting for connections
+- Entire system gets slow
+
+Separate pools approach (GOOD):
+- Primary: 10 connections (conservative, critical operations)
+- Replica: 20 connections (generous, non-critical reads)
+- No contention between read and write paths
+```
+
+**Interview Response:**
+
+"I configured separate connection pools because the access patterns are fundamentally different. The primary handles transactional writes and consistency-critical reads—these are latency-sensitive and shouldn't wait behind bulk non-critical reads. The replica handles read-heavy traffic where slight delays are acceptable. By separating the pools, I ensured write operations never starve due to read traffic, providing predictable latency for the critical path."
+
+---
+
+### Decision 2: Why ThreadLocal for Routing Context?
+
+**Context:**
+
+The routing decision (PRIMARY vs REPLICA) must be made per-request, not globally.
+
+**Decision:**
+
+Use `ThreadLocal<DataSourceType>` to store routing context.
+
+**Why:**
+
+```
+Global variable (BAD):
+Thread-1: Sets REPLICA
+Thread-2: Inherits REPLICA (WRONG - should be PRIMARY)
+Data inconsistency!
+
+ThreadLocal (GOOD):
+Thread-1: REPLICA (isolated)
+Thread-2: PRIMARY (isolated)
+No cross-contamination
+```
+
+**Interview Response:**
+
+"I chose ThreadLocal because each HTTP request runs on an application server thread, and the routing decision belongs to that specific request. ThreadLocal provides thread-safe, request-scoped storage. However, this comes with a critical responsibility: the context must be cleared in a finally block because Tomcat reuses threads. If I don't clear, the next request on that thread might inherit the wrong routing. This is a pattern I've seen cause subtle production bugs when misunderstood."
+
+---
+
+### Decision 3: Why Not Always Use Replica?
+
+**Context:**
+
+Replica has 2x the connections and lower CPU. Why not route all reads there?
+
+**Decision:**
+
+Use @PrimaryRead for consistency-sensitive operations.
+
+**Why:**
+
+```
+Scenario: Customer transfers ₹1000
+Primary: Balance goes from ₹5000 → ₹4000
+Replica: Still shows ₹5000 (async replication lag)
+
+All reads to replica (BAD):
+GET /balance → Replica → ₹5000 (WRONG!)
+Application thinks transfer failed
+Customer retries transfer
+₹1000 gets deducted twice!
+
+@PrimaryRead (GOOD):
+GET /balance → Primary → ₹4000 (CORRECT)
+Replication lag doesn't cause consistency issues
+```
+
+**Interview Response:**
+
+"Replication lag is the core constraint. For banking, balance must always reflect the latest state. I classify reads: consistency-sensitive operations (balance, validation) use @PrimaryRead to hit the primary. Non-critical reads (transaction history, account list) use @ReadOnly to hit the replica. This layered approach lets me scale read traffic without introducing consistency bugs. The key insight is that 'read-heavy' doesn't mean 'all reads can be eventual-consistency'—the business requirements determine which reads need strong consistency."
+
+---
+
+### Decision 4: Why VERIFY_IDENTITY, Not VERIFY_CA?
+
+**Context:**
+
+TLS can be configured at different verification levels.
+
+**Decision:**
+
+Use `sslMode=VERIFY_IDENTITY` for production.
+
+**Why:**
+
+```
+VERIFY_CA (RISKY):
+- Checks: Cert is signed by trusted CA
+- Missing: Hostname verification
+- Vulnerability: Man-in-the-middle attack
+  
+  Attacker gets cert for amazon.com signed by same CA
+  Application trusts it because CA is trusted
+  Traffic gets intercepted!
+
+VERIFY_IDENTITY (SECURE):
+- Checks: Cert is signed by trusted CA
+- Checks: Hostname matches expected endpoint
+  
+  Application expects: citicore-mysql-primary.cnk8ckkm2hsk...
+  Attacker's cert is for: amazon.com
+  Mismatch → Connection rejected
+```
+
+**Interview Response:**
+
+"VERIFY_IDENTITY is the proper production TLS configuration. It verifies both the certificate chain and the server's identity by checking hostname matching. VERIFY_CA alone only verifies the certificate was signed by a trusted authority, which doesn't prevent man-in-the-middle attacks. For a banking application handling sensitive customer data, this extra verification is essential. The tradeoff is minimal—it adds only microseconds of validation overhead and provides significant security improvement."
+
+---
+
+### Decision 5: Why Partition by created_at?
+
+**Context:**
+
+account_statements grows to billions of rows annually.
+
+**Decision:**
+
+Partition by `created_at` into monthly ranges.
+
+**Why:**
+
+```
+Without partitioning (SLOW):
+SELECT * FROM account_statements
+WHERE account_number = ? AND created_at >= ?
+→ Full table scan: 3.6 billion rows
+→ 30+ seconds
+
+With monthly partitioning (FAST):
+- Query identifies relevant partition(s)
+- Scans only June's 300M rows
+- ~1 second (30x faster)
+- Partition pruning happens automatically
+```
+
+**Interview Response:**
+
+"Partitioning by created_at is a natural choice for time-series data. Banking transactions are inherently temporal, and queries always include a date range. Monthly partitions provide the right balance: small enough for pruning efficiency, large enough to avoid too many partition objects. A critical implementation detail: the partitioning column must be included in primary and unique keys. This constraint teaches discipline about schema design and ensures queries can use partition pruning effectively."
+
+---
+
+### Decision 6: Why Transactional Outbox?
+
+**Context:**
+
+Need to publish events to Kafka reliably.
+
+**Decision:**
+
+Store events in database first (outbox), publish asynchronously.
+
+**Why:**
+
+```
+Without Outbox (RISKY):
+1. Update DB ✅
+2. Publish to Kafka ❌ (fails)
+Result: Other services don't know about change!
+Eventual consistency broken!
+
+With Outbox (RELIABLE):
+1. Update DB + Insert event (same transaction) ✅
+2. Async publisher reads events ✅
+3. Publishes to Kafka ✅
+4. Marks event as SENT ✅
+Result: Both DB and Kafka always consistent
+```
+
+**Interview Response:**
+
+"The Outbox pattern solves the dual-write problem elegantly. Both the account update and the outbox event are part of the same database transaction—they either both succeed or both fail. This guarantees the event is never lost due to Kafka failures. Later, a background publisher reads pending events and publishes them to Kafka. If Kafka fails, events stay in PENDING status and retry automatically. This pattern is standard in event-driven systems and provides the reliability guarantees banking applications require."
+
+---
+
+## Key Takeaways
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Production-Grade Banking Microservice Pattern           │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│ 1. Primary/Replica architecture                          │
+│    - Scales read traffic without overwhelming primary   │
+│                                                          │
+│ 2. Explicit read classification                          │
+│    - @ReadOnly for non-critical reads (→ REPLICA)       │
+│    - @PrimaryRead for critical reads (→ PRIMARY)        │
+│    - Default to PRIMARY (safety-first)                  │
+│                                                          │
+│ 3. Connection pooling                                    │
+│    - Separate pools per datasource                      │
+│    - Independent size tuning                            │
+│    - Prevents connection starvation                     │
+│                                                          │
+│ 4. TLS encryption                                        │
+│    - VERIFY_IDENTITY mode (not just VERIFY_CA)          │
+│    - Protects against man-in-the-middle                │
+│                                                          │
+│ 5. MySQL partitioning                                    │
+│    - Monthly ranges for billions of rows               │
+│    - Automatic partition pruning                        │
+│    - Efficient data cleanup                             │
+│                                                          │
+│ 6. Transactional Outbox                                 │
+│    - Events stored with updates in same transaction    │
+│    - Async publisher for reliability                    │
+│    - Kafka consistency guaranteed                       │
+│                                                          │
+│ 7. Thread safety                                         │
+│    - ThreadLocal for request-scoped context             │
+│    - Always clear in finally blocks                     │
+│    - No cross-request contamination                     │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
