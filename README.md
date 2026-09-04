@@ -13579,5 +13579,2161 @@ Monitoring
 ```
 
 ---
+# CitiCore User Service - Comprehensive Detailed Notes
 
+**Complete guide to deploying User Service on AWS ECS Fargate with KYC document management, profile management, S3 integration, Kafka event publishing, and JWT authentication.**
 
+---
+
+## Table of Contents
+
+1. [User Service Architecture](#user-service-architecture)
+2. [Technology Stack](#technology-stack)
+3. [Maven Build & Dependencies](#maven-build--dependencies)
+4. [Configuration Management](#configuration-management)
+5. [Docker Build & ECR](#docker-build--ecr)
+6. [ECS Task Definition](#ecs-task-definition)
+7. [Environment Variables & Secrets](#environment-variables--secrets)
+8. [Application Load Balancer](#application-load-balancer)
+9. [Target Group Configuration](#target-group-configuration)
+10. [Security Group Rules](#security-group-rules)
+11. [Health Monitoring](#health-monitoring)
+12. [User Profile Management](#user-profile-management)
+13. [KYC Workflow](#kyc-workflow)
+14. [S3 Document Storage](#s3-document-storage)
+15. [Kafka Event Publishing](#kafka-event-publishing)
+16. [JWT Authentication](#jwt-authentication)
+17. [Real Issues & Solutions](#real-issues--solutions)
+18. [Security Best Practices](#security-best-practices)
+19. [Interview-Ready Explanations](#interview-ready-explanations)
+
+---
+
+## User Service Architecture
+
+### Definition
+
+**User Service** manages user accounts, profiles, and Know-Your-Customer (KYC) verification. It handles user registration, profile updates, document uploads, and KYC status tracking for banking onboarding.
+
+### What You Implemented
+
+```
+CitiCore User Service Architecture:
+
+                    Internet
+                       |
+                       v
+            citicore-user-alb:8082
+                       |
+                       v
+            citicore-user-tg
+                       |
+                       v
+        ECS User Service (10.0.1.81:8082)
+                       |
+        +--------------+----------+----------+
+        |              |          |          |
+        v              v          v          v
+      RDS         Eureka    Kafka      S3
+     MySQL        (Discovery) (Events) (KYC Docs)
+        |              |          |          |
+        └──────────────┴──────────┴──────────┘
+              Config Server
+              (Centralized Config)
+```
+
+### Key Responsibilities
+
+```
+User Profile Management:
+├─ Create user profile
+├─ Retrieve profile
+├─ Update profile information
+└─ Store in RDS MySQL
+
+KYC (Know-Your-Customer):
+├─ Upload identity documents (Aadhaar, PAN, etc.)
+├─ Store documents in S3
+├─ Track KYC status (PENDING → UNDER_REVIEW → APPROVED/REJECTED)
+├─ Admin review workflow
+└─ Publish events to Kafka
+
+Integration Points:
+├─ RDS: Store user profiles and KYC metadata
+├─ Eureka: Register as discoverable service
+├─ Kafka: Publish KYC status change events
+├─ S3: Store KYC documents
+├─ Config Server: Get centralized configuration
+├─ ALB: Expose APIs to internet
+└─ JWT: Authenticate requests
+```
+
+---
+
+## Technology Stack
+
+### Definition
+
+**Technology Stack** is the set of software tools, frameworks, and services used to build and deploy the service.
+
+### What You Implemented
+
+```
+Java 17
+├─ LTS (Long-Term Support) version
+├─ Stable, widely used in production
+└─ Matches platform standard
+
+Spring Boot 3.2.4
+├─ Application framework
+├─ Auto-configuration
+├─ Actuator endpoints
+└─ Consistent with other services
+
+Spring Cloud Integration:
+├─ Config Client (fetch from Config Server)
+├─ Eureka Client (service discovery)
+├─ Spring Cloud Bus (configuration refresh via Kafka)
+└─ Version: 2023.0.3 (compatible with Boot 3.2.4)
+
+Database & Caching:
+├─ Spring Data JPA (ORM)
+├─ MySQL Connector (JDBC driver)
+├─ Redis (distributed caching)
+└─ Connection pooling built-in
+
+Security & Authentication:
+├─ Spring Security
+├─ JWT (JSON Web Tokens) using JJWT library
+├─ Authentication/Authorization
+└─ Role-based access control
+
+AWS Integration:
+├─ AWS SDK v2
+├─ Amazon S3 (document storage)
+├─ S3Presigner (temporary access URLs)
+└─ IAM role assumption for credentials
+
+Event Processing:
+├─ Spring Kafka
+├─ Spring Cloud Bus for distributed events
+├─ Kafka producer for KYC events
+└─ Consumer for bus commands
+
+Email & Notifications:
+├─ Spring Mail
+├─ SendGrid Java library
+└─ Outbound email capability
+
+Document Processing:
+├─ Google Cloud Vision API
+├─ Image/document analysis capability
+└─ Optional for document validation
+
+Monitoring & Operations:
+├─ Spring Boot Actuator
+├─ Micrometer + Prometheus
+├─ Health checks
+└─ Metrics exposure
+
+Container & Cloud:
+├─ Docker (containerization)
+├─ AWS ECS/Fargate (orchestration)
+├─ AWS ALB (load balancing)
+└─ AWS Secrets Manager (credential storage)
+```
+
+---
+
+## Maven Build & Dependencies
+
+### Definition
+
+**Maven** is a build automation tool that manages dependencies, compiles code, runs tests, and packages applications.
+
+### What You Implemented
+
+**JAR Size & Target:**
+
+```
+Generated JAR: target/user-service-0.0.1-SNAPSHOT.jar
+Size: 159,893,818 bytes (~160 MB)
+Java Target: 17
+
+Size Breakdown (typical):
+├─ Spring Boot base: ~50 MB
+├─ Spring Cloud libraries: ~40 MB
+├─ AWS SDK: ~20 MB
+├─ Database drivers: ~10 MB
+├─ Other dependencies: ~40 MB
+└─ Total: ~160 MB
+```
+
+**Critical Dependencies:**
+
+```xml
+<!-- Web Framework -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+
+<!-- Database -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-jpa</artifactId>
+</dependency>
+<dependency>
+    <groupId>mysql</groupId>
+    <artifactId>mysql-connector-j</artifactId>
+</dependency>
+
+<!-- Security -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+
+<!-- JWT -->
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-api</artifactId>
+    <version>0.12.5</version>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-impl</artifactId>
+    <version>0.12.5</version>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-jackson</artifactId>
+    <version>0.12.5</version>
+</dependency>
+
+<!-- Service Discovery & Config -->
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-netflix-eureka-client</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-config</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-bus-kafka</artifactId>
+</dependency>
+
+<!-- Event Processing -->
+<dependency>
+    <groupId>org.springframework.kafka</groupId>
+    <artifactId>spring-kafka</artifactId>
+</dependency>
+
+<!-- Caching -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+
+<!-- Email -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-mail</artifactId>
+</dependency>
+<dependency>
+    <groupId>com.sendgrid</groupId>
+    <artifactId>sendgrid-java</artifactId>
+</dependency>
+
+<!-- AWS -->
+<dependency>
+    <groupId>software.amazon.awssdk</groupId>
+    <artifactId>s3</artifactId>
+</dependency>
+
+<!-- Monitoring -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+
+<!-- Shared Events -->
+<dependency>
+    <groupId>com.citicore</groupId>
+    <artifactId>kafka-events</artifactId>
+    <version>1.0.0</version>
+</dependency>
+```
+
+### Build Process
+
+**Step 1: Clean & Compile**
+
+```bash
+mvn clean compile
+# Removes previous build, compiles Java source files
+# Produces target/classes directory
+```
+
+**Step 2: Run Tests**
+
+```bash
+mvn test
+# Runs all tests in src/test/java
+# Verifies functionality before packaging
+```
+
+**Step 3: Package JAR**
+
+```bash
+mvn package
+# Creates target/user-service-0.0.1-SNAPSHOT.jar
+# Includes compiled classes + all dependencies
+# Ready to run with: java -jar user-service-0.0.1-SNAPSHOT.jar
+```
+
+**Complete Build Command**
+
+```bash
+# Full build with all steps
+mvn clean package
+
+# Skip tests (faster, for quick deployments)
+mvn clean package -DskipTests
+
+# View dependency tree
+mvn dependency:tree | grep "kafka-events"
+```
+
+---
+
+## Configuration Management
+
+### Definition
+
+**Configuration Management** centralizes service settings in a Git-backed Config Server, allowing runtime changes without redeployment.
+
+### What You Implemented
+
+**Bootstrap Configuration (application.yml):**
+
+```yaml
+server:
+  port: 8082
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 5MB
+      max-request-size: 5MB
+
+spring:
+  application:
+    name: user-service
+  
+  config:
+    import: optional:configserver:http://citicore-config-alb-1654378622.ap-south-1.elb.amazonaws.com
+```
+
+**Config Server Returns (user-service.yml + application.yml):**
+
+```yaml
+# Centralized configuration from Git repo
+
+# Database
+spring:
+  datasource:
+    url: jdbc:mysql://${AUTH_DB_HOST}:3306/citicore_userdb
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+# Service Discovery
+  eureka:
+    client:
+      service-url:
+        defaultZone: http://eureka-server-8761-tcp.citicore:8761/eureka
+
+# Kafka
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
+    consumer:
+      group-id: user-group
+
+# AWS
+aws:
+  region: ${AWS_REGION:ap-south-1}
+  s3:
+    bucket: ${S3_BUCKET:citicore-kyc-docs}
+
+# KYC
+kyc:
+  upload-dir: uploads/kyc/
+
+# Logging
+logging:
+  level:
+    com.citicore.user: DEBUG
+```
+
+### Why Config Server
+
+```
+Benefits:
+
+1. Centralization
+   ├─ Single source of truth
+   ├─ Easy to track changes
+   └─ Version control in Git
+
+2. No Image Rebuilds
+   ├─ Change config in Git
+   ├─ Spring Cloud Bus publishes event
+   ├─ Service refreshes automatically
+   └─ No redeployment needed
+
+3. Environment Parity
+   ├─ Same code, different config
+   ├─ Dev/staging/prod use same JAR
+   └─ Reduce "works on my machine" problems
+
+4. Secrets Separation
+   ├─ Passwords via environment variables
+   ├─ Config in Git (public)
+   ├─ Secrets in Secrets Manager (private)
+   └─ Never commit passwords to Git
+```
+
+---
+
+## Docker Build & ECR
+
+### Definition
+
+**Docker** packages the JAR with Java runtime into a container. **ECR** (Elastic Container Registry) stores Docker images in AWS.
+
+### What You Implemented
+
+**Dockerfile:**
+
+```dockerfile
+# Multi-stage would be ideal for size reduction
+FROM eclipse-temurin:17-jre
+
+WORKDIR /app
+
+# Copy Maven-built JAR
+COPY target/user-service-0.0.1-SNAPSHOT.jar app.jar
+
+# Document port
+EXPOSE 8082
+
+# Start Spring Boot application
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+### Step-by-Step Docker & ECR Process
+
+**Step 1: Build Docker Image Locally**
+
+```bash
+# Build with Maven first
+mvn clean package
+
+# Build Docker image
+docker build -t citicore/user-service:1.0 .
+
+# Test locally
+docker run -d -p 8082:8082 \
+  -e AUTH_DB_HOST=localhost \
+  -e DB_USERNAME=user \
+  -e DB_PASSWORD=password \
+  citicore/user-service:1.0
+
+# Verify
+curl http://localhost:8082/actuator/health
+# Output: {"status":"UP"} or {"status":"DOWN"} depending on dependencies
+```
+
+**Step 2: Create ECR Repository**
+
+```bash
+# Create repository
+aws ecr create-repository \
+  --repository-name citicore/user-service \
+  --region ap-south-1
+
+# Output includes URI:
+# 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/user-service
+```
+
+**Step 3: Push to ECR**
+
+```bash
+# Authenticate Docker with ECR
+aws ecr get-login-password --region ap-south-1 | \
+  docker login --username AWS --password-stdin \
+  580655778303.dkr.ecr.ap-south-1.amazonaws.com
+
+# Tag image for ECR
+docker tag citicore/user-service:1.0 \
+  580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/user-service:1.0
+
+# Push to ECR
+docker push 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/user-service:1.0
+
+# Verify in ECR
+aws ecr list-images --repository-name citicore/user-service
+```
+
+**Real Issue You Encountered:**
+
+```
+Error: RepositoryNotFoundException
+Message: The repository with name 'citicore/user-service' does not exist
+
+Cause:
+├─ Attempted to push to non-existent repository
+├─ ECR requires repository creation before pushing
+└─ Repository auto-creation is disabled by default
+
+Solution:
+└─ Create repository first (Step 2)
+
+Lesson:
+└─ Always create ECR repository before building/pushing images
+```
+
+---
+
+## ECS Task Definition
+
+### Definition
+
+**Task Definition** is the blueprint describing how User Service runs: image, CPU, memory, ports, environment variables, logging.
+
+### What You Implemented
+
+```yaml
+Task Definition: citicore-user-service
+
+Compute:
+  Launch Type: FARGATE
+  CPU: 1 vCPU (1024 units)
+  Memory: 3 GB
+  Network Mode: awsvpc
+
+Container:
+  Name: user-service
+  Image: 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/user-service:1.0
+  Port: 8082
+  
+Environment Variables:
+  AUTH_DB_HOST: (RDS endpoint)
+  DB_USERNAME: (from Secrets Manager)
+  DB_PASSWORD: (from Secrets Manager)
+  KAFKA_BOOTSTRAP_SERVERS: 10.0.1.87:9092
+  AWS_REGION: ap-south-1
+  S3_BUCKET: citicore-kyc-docs
+  JWT_SECRET: (from Secrets Manager)
+
+Logging:
+  LogDriver: awslogs
+  LogGroup: /ecs/citicore-user-service
+  Region: ap-south-1
+
+Health Check:
+  Command: curl -f http://localhost:8082/actuator/health || exit 1
+  Interval: 30s
+  Timeout: 5s
+  Retries: 3
+  StartPeriod: 60s
+```
+
+### Resource Justification
+
+```
+CPU: 1 vCPU
+├─ User Service: medium CPU usage
+├─ Profile operations: light
+├─ KYC processing: moderate
+├─ JWT validation: light
+├─ 0.5 vCPU insufficient (may timeout)
+├─ 2 vCPU overkill for single instance
+└─ 1 vCPU optimal
+
+Memory: 3 GB
+├─ Spring Boot base: ~300 MB
+├─ Spring Cloud libraries: ~400 MB
+├─ AWS SDK: ~200 MB
+├─ Security libraries: ~200 MB
+├─ Database connections (HikariCP): ~200 MB
+├─ User data in memory: ~100 MB
+├─ Safety margin: ~1600 MB
+└─ Total needed: ~3000 MB
+
+File Upload: 5 MB max
+├─ KYC documents: typically 1-3 MB
+├─ Aadhaar scan: ~800 KB
+├─ PAN card: ~600 KB
+├─ 5 MB limit: reasonable upper bound
+└─ Prevents DoS via massive uploads
+```
+
+---
+
+## Environment Variables & Secrets
+
+### Definition
+
+**Environment Variables** pass runtime configuration. **Secrets Manager** securely stores sensitive values.
+
+### What You Implemented
+
+**Non-Sensitive Environment Variables (ECS task definition):**
+
+```yaml
+AUTH_DB_HOST: citicore-mysql-primary.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com
+KAFKA_BOOTSTRAP_SERVERS: 10.0.1.87:9092
+AWS_REGION: ap-south-1
+S3_BUCKET: citicore-kyc-docs
+```
+
+**Sensitive Values (AWS Secrets Manager):**
+
+```yaml
+DB_USERNAME: (referenced via ValueFrom ARN)
+DB_PASSWORD: (referenced via ValueFrom ARN)
+JWT_SECRET: (referenced via ValueFrom ARN)
+AWS_ACCESS_KEY_ID: (referenced via ValueFrom ARN)
+AWS_SECRET_ACCESS_KEY: (referenced via ValueFrom ARN)
+```
+
+**ECS Task Definition References:**
+
+```json
+{
+  "containerDefinitions": [
+    {
+      "environment": [
+        {
+          "name": "AUTH_DB_HOST",
+          "value": "citicore-mysql-primary.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com"
+        },
+        {
+          "name": "KAFKA_BOOTSTRAP_SERVERS",
+          "value": "10.0.1.87:9092"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "ap-south-1"
+        },
+        {
+          "name": "S3_BUCKET",
+          "value": "citicore-kyc-docs"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "DB_USERNAME",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:580655778303:secret:citicore/auth-service/database-tXq98R:DB_USERNAME::"
+        },
+        {
+          "name": "DB_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:580655778303:secret:citicore/auth-service/database-tXq98R:DB_PASSWORD::"
+        },
+        {
+          "name": "JWT_SECRET",
+          "valueFrom": "arn:aws:secretsmanager:ap-south-1:580655778303:secret:citicore/auth-service/jwt-q8jqXN:JWT_SECRET::"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Security Best Practices
+
+```
+DO NOT COMMIT TO GIT:
+├─ DB_PASSWORD
+├─ JWT_SECRET
+├─ AWS_ACCESS_KEY
+├─ AWS_SECRET_KEY
+└─ API keys
+
+DO:
+├─ Use AWS Secrets Manager
+├─ Reference ARNs in task definition
+├─ Store only environment variable names in config
+├─ ECS injects secrets at runtime
+└─ Secrets never appear in container logs
+```
+
+---
+
+## Application Load Balancer
+
+### Definition
+
+**Application Load Balancer (ALB)** distributes external traffic across User Service instances and provides DNS endpoint for API access.
+
+### What You Implemented
+
+**User ALB Configuration:**
+
+```
+Name: citicore-user-alb
+Type: Application Load Balancer
+Scheme: Internet-facing
+IP Type: IPv4
+VPC: vpc-0d064f45265cbcdad
+
+Availability Zones:
+├─ ap-south-1a
+└─ ap-south-1b
+
+DNS Endpoint:
+citicore-user-alb-1349147446.ap-south-1.elb.amazonaws.com
+
+External Access URL:
+http://citicore-user-alb-1349147446.ap-south-1.elb.amazonaws.com:8082
+```
+
+### Traffic Flow
+
+```
+Internet Client
+      │
+      ↓
+HTTP :8082
+      │
+      ↓
+User ALB (citicore-user-alb)
+      │
+      ├─ Security Group: citicore-alb-sg
+      ├─ Rule: TCP 8082, Source: 0.0.0.0/0
+      │
+      ↓
+ALB Listener
+      │
+      ├─ Protocol: HTTP
+      ├─ Port: 8082
+      │
+      ↓
+Target Group (citicore-user-tg)
+      │
+      ├─ Target Type: IP
+      ├─ Protocol: HTTP
+      ├─ Port: 8082
+      │
+      ↓
+User Service Task
+      │
+      ├─ Private IP: 10.0.1.81
+      ├─ Port: 8082
+      ├─ Security Group: citicore-ecs-sg
+      │
+      ↓
+Application Logic
+```
+
+---
+
+## Target Group Configuration
+
+### Definition
+
+**Target Group** is where ALB sends traffic. It performs health checks and registers/deregisters targets.
+
+### What You Implemented
+
+**User Target Group (citicore-user-tg):**
+
+```yaml
+Name: citicore-user-tg
+
+Configuration:
+  Target Type: IP
+  Protocol: HTTP
+  Port: 8082
+  Protocol Version: HTTP/1
+  VPC: vpc-0d064f45265cbcdad
+
+Health Check:
+  Enabled: true
+  Protocol: HTTP
+  Path: /actuator/health
+  Port: 8082
+  Interval: 30 seconds
+  Timeout: 5 seconds
+  Healthy Threshold: 2
+  Unhealthy Threshold: 3
+
+Registered Targets:
+  ├─ 10.0.1.81:8082 (User Service task IP)
+  └─ Health Status: Healthy
+```
+
+### Real Problem You Encountered
+
+**Initial State:**
+
+```
+Total Targets: 0
+Status: No targets registered
+Health: N/A
+```
+
+**Problem:**
+
+```
+No ECS task IP was registered with target group.
+Result: ALB had nowhere to send traffic.
+```
+
+**Solution:**
+
+```bash
+# Register User Service task IP
+aws elbv2 register-targets \
+  --target-group-arn arn:aws:elasticloadbalancing:... \
+  --targets Id=10.0.1.81,Port=8082
+
+# Verify
+aws elbv2 describe-target-health \
+  --target-group-arn arn:aws:elasticloadbalancing:...
+
+# Status changes:
+Initial:    registering
+Then:       draining (initial health checks)
+Finally:    healthy
+```
+
+---
+
+## Security Group Rules
+
+### Definition
+
+**Security Groups** are virtual firewalls controlling inbound/outbound traffic.
+
+### What You Implemented
+
+**User ALB Security Group (citicore-alb-sg):**
+
+```
+Inbound Rules:
+
+Rule: Allow external traffic to ALB
+├─ Type: Custom TCP
+├─ Protocol: TCP
+├─ Port: 8082
+├─ Source: 0.0.0.0/0 (any IPv4)
+├─ Description: "User Service ALB HTTP"
+└─ Purpose: Internet clients reach ALB
+```
+
+**ECS Security Group (citicore-ecs-sg):**
+
+```
+Existing Inbound Rules:
+
+Rule 1: Allow ALB to reach User Service
+├─ Type: Custom TCP
+├─ Protocol: TCP
+├─ Port: 8082
+├─ Source: sg-09208846c8786e541 (ALB SG)
+└─ Purpose: ALB forwards to ECS task
+
+Rule 2: Allow ECS services to reach Eureka
+├─ Type: Custom TCP
+├─ Protocol: TCP
+├─ Port: 8761
+├─ Source: sg-0b8ac20679059c792 (ECS SG itself)
+└─ Purpose: Service discovery
+
+Rule 3: Service to service communication
+├─ Type: Custom TCP
+├─ Protocol: TCP
+├─ Port: 8081 (Auth Service)
+├─ Source: sg-08793739fad096a19 (Auth ALB SG)
+└─ Purpose: Cross-service calls
+
+Rule 4: Config Server access
+├─ Type: Custom TCP
+├─ Protocol: TCP
+├─ Port: 8888
+├─ Source: sg-09208846c8786e541 (ALB SG)
+└─ Purpose: Fetch configuration
+```
+
+### Real Problem You Encountered
+
+**Initial Symptom:**
+
+```
+Target Health Status: Unhealthy
+Reason: Request timed out
+```
+
+**Investigation:**
+
+```
+Step 1: Check ECS SG
+├─ Rule 8082 exists: ✓
+├─ Source: ALB SG: ✓
+└─ Conclusion: ECS SG correct
+
+Step 2: Check ALB SG
+├─ Inbound rule for 8082: ✗ MISSING!
+├─ Result: External requests blocked
+└─ Conclusion: ALB SG needs rule
+```
+
+**Root Cause:**
+
+```
+ALB SG missing inbound rule for port 8082.
+ALB could not accept traffic on listener port.
+Traffic path blocked at ALB security group.
+```
+
+**Solution:**
+
+```bash
+# Add inbound rule to ALB security group
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-09208846c8786e541 \
+  --protocol tcp \
+  --port 8082 \
+  --cidr 0.0.0.0/0 \
+  --description "User Service ALB HTTP"
+
+# Verify
+aws ec2 describe-security-groups \
+  --group-ids sg-09208846c8786e541 \
+  --query 'SecurityGroups[0].IpPermissions' | grep 8082
+
+# Result: Rule now shows port 8082 allowed from 0.0.0.0/0
+```
+
+**Result:**
+
+```
+After adding rule:
+├─ Target Health Status: Healthy
+├─ Health checks passing
+├─ Traffic flowing correctly
+└─ ALB ↔ ECS connectivity works
+```
+
+---
+
+## Health Monitoring
+
+### Definition
+
+**Health Monitoring** checks component health: database, Eureka, Kafka, Redis, Config Server.
+
+### Actuator Health Endpoint
+
+**Request:**
+
+```bash
+curl http://citicore-user-alb-1349147446.ap-south-1.elb.amazonaws.com:8082/actuator/health
+```
+
+**Response:**
+
+```json
+{
+  "status": "DOWN",
+  "components": {
+    "binders": {"status": "UP"},
+    "clientConfigServer": {"status": "UP"},
+    "db": {
+      "status": "UP",
+      "details": {
+        "database": "MySQL",
+        "hello": 1
+      }
+    },
+    "discoveryComposite": {"status": "UP"},
+    "diskSpace": {"status": "UP"},
+    "ping": {"status": "UP"},
+    "redis": {
+      "status": "DOWN",
+      "error": "Unable to connect to Redis at localhost:6379"
+    }
+  }
+}
+```
+
+### Component Verification
+
+**1. Database (db): UP**
+
+```
+Status: UP
+Meaning:
+├─ MySQL connection working
+├─ RDS accessible from ECS
+├─ JDBC URL correct
+├─ Credentials valid
+└─ HikariCP pool operational
+
+Verified:
+User Service → RDS Primary (citicore-mysql-primary)
+```
+
+**2. Config Server (clientConfigServer): UP**
+
+```
+Status: UP
+Sources:
+├─ user-service.yml (specific config)
+├─ application.yml (shared config)
+└─ configClient (Spring property source)
+
+Meaning:
+├─ Config Server reachable
+├─ Git config repository accessible
+├─ Configuration loaded successfully
+└─ Centralized config working
+```
+
+**3. Service Discovery (discoveryComposite): UP**
+
+```
+Status: UP
+Registered Services:
+├─ AUTH-SERVICE: 1 instance
+└─ USER-SERVICE: 1 instance (this service)
+
+Meaning:
+├─ Eureka Server reachable
+├─ Service successfully registered
+├─ Heartbeats sending successfully
+└─ Can discover other services
+```
+
+**4. Kafka (binders): UP**
+
+```
+Status: UP
+Meaning:
+├─ Kafka broker reachable (10.0.1.87:9092)
+├─ Spring Cloud Bus listener active
+├─ Can publish KYC events
+├─ Can consume refresh events
+└─ Kafka connectivity working
+```
+
+**5. Redis (redis): DOWN**
+
+```
+Status: DOWN
+Error: RedisConnectionFailureException: Unable to connect to Redis at localhost:6379
+
+Cause:
+├─ Redis not deployed
+├─ Redis not configured in ECS
+├─ REDIS_HOST environment variable missing
+└─ Not critical for User Service
+
+Solution:
+├─ Option 1: Deploy/configure Redis (for caching)
+├─ Option 2: Disable Redis health indicator
+└─ Left for later to continue deployments
+```
+
+### Disabling Redis Health Check (if not needed)
+
+```yaml
+# application.yml or via Config Server
+management:
+  health:
+    redis:
+      enabled: false
+
+# Result: Overall status would be UP
+# Redis component no longer checked
+```
+
+---
+
+## User Profile Management
+
+### Definition
+
+**User Profile** stores personal information: name, email, phone, address, date of birth. User Service manages create/read/update operations.
+
+### Endpoints
+
+```
+Base Path: /api/v1/users
+
+GET /api/v1/users/test
+├─ Purpose: Simple connectivity test
+├─ Auth: Not required
+├─ Response: {"message":"OK"} or similar
+└─ Status: 200 OK
+
+POST /api/v1/users/profile
+├─ Purpose: Create user profile
+├─ Auth: Bearer JWT required
+├─ Content-Type: application/json
+└─ Payload: Profile data
+
+GET /api/v1/users/profile
+├─ Purpose: Retrieve authenticated user's profile
+├─ Auth: Bearer JWT required
+└─ Response: Profile data
+
+PUT /api/v1/users/profile
+├─ Purpose: Update authenticated user's profile
+├─ Auth: Bearer JWT required
+├─ Content-Type: application/json
+└─ Payload: Fields to update
+```
+
+### Create Profile (POST)
+
+**Request:**
+
+```bash
+curl -X POST http://user-alb:8082/api/v1/users/profile \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -d '{
+    "firstName": "Mahammad",
+    "lastName": "Rabbani",
+    "email": "mahammad.rabbani51@gmail.com",
+    "phoneNumber": "9876543210",
+    "dateOfBirth": "1999-06-15",
+    "address": "123 Main Street",
+    "city": "Hyderabad",
+    "state": "Telangana",
+    "pincode": "500001"
+  }'
+```
+
+**Implementation:**
+
+```java
+@PostMapping("/profile")
+@PreAuthorize("isAuthenticated()")
+public ResponseEntity<ProfileResponse> createProfile(
+    @RequestBody ProfileRequest request,
+    Authentication auth) {
+    
+    // Get authenticated user ID from JWT
+    String userId = ((JwtUserPrincipal) auth.getPrincipal()).getId();
+    
+    // Create profile entity
+    UserProfile profile = new UserProfile();
+    profile.setUserId(userId);
+    profile.setFirstName(request.getFirstName());
+    profile.setLastName(request.getLastName());
+    // ... set other fields
+    
+    // Save to database
+    userProfileRepository.save(profile);
+    
+    // Return created response
+    return ResponseEntity
+        .status(HttpStatus.CREATED)
+        .body(new ProfileResponse(profile));
+}
+```
+
+### Retrieve Profile (GET)
+
+**Request:**
+
+```bash
+curl -X GET http://user-alb:8082/api/v1/users/profile \
+  -H "Authorization: Bearer <JWT_TOKEN>"
+```
+
+**Response:**
+
+```json
+{
+  "userId": "123",
+  "firstName": "Mahammad",
+  "lastName": "Rabbani",
+  "email": "mahammad.rabbani51@gmail.com",
+  "phoneNumber": "9876543210",
+  "dateOfBirth": "1999-06-15",
+  "address": "123 Main Street",
+  "city": "Hyderabad",
+  "state": "Telangana",
+  "pincode": "500001",
+  "createdAt": "2026-08-30T10:00:00Z",
+  "updatedAt": "2026-08-30T10:00:00Z"
+}
+```
+
+### Update Profile (PUT)
+
+**Request:**
+
+```bash
+curl -X PUT http://user-alb:8082/api/v1/users/profile \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -d '{
+    "phoneNumber": "9876543211",
+    "address": "456 New Street",
+    "city": "Bangalore",
+    "state": "Karnataka",
+    "pincode": "560001"
+  }'
+```
+
+**Implementation:**
+
+```java
+@PutMapping("/profile")
+@PreAuthorize("isAuthenticated()")
+public ResponseEntity<ProfileResponse> updateProfile(
+    @RequestBody ProfileUpdateRequest request,
+    Authentication auth) {
+    
+    String userId = ((JwtUserPrincipal) auth.getPrincipal()).getId();
+    
+    // Fetch existing profile
+    UserProfile profile = userProfileRepository
+        .findByUserId(userId)
+        .orElseThrow(() -> new ProfileNotFoundException());
+    
+    // Update fields
+    if (request.getPhoneNumber() != null) {
+        profile.setPhoneNumber(request.getPhoneNumber());
+    }
+    if (request.getAddress() != null) {
+        profile.setAddress(request.getAddress());
+    }
+    // ... update other fields
+    
+    // Save changes
+    userProfileRepository.save(profile);
+    
+    return ResponseEntity.ok(new ProfileResponse(profile));
+}
+```
+
+---
+
+## KYC Workflow
+
+### Definition
+
+**Know-Your-Customer (KYC)** is the banking compliance process of verifying user identity and preventing fraud. User Service manages document uploads and status tracking.
+
+### KYC Statuses
+
+```
+PENDING
+├─ Initial state after user registration
+├─ No documents uploaded
+└─ User must complete KYC
+
+UNDER_REVIEW
+├─ Documents uploaded
+├─ Awaiting admin approval
+└─ Email sent to user
+
+APPROVED
+├─ Admin approved documents
+├─ User can open accounts
+├─ Email sent to user
+
+REJECTED
+├─ Admin rejected documents
+├─ User must resubmit
+└─ Email sent to user with reason
+```
+
+### KYC Endpoints
+
+```
+Base Path: /api/v1/users/kyc
+
+POST /api/v1/users/kyc/upload
+├─ Upload identity document
+├─ Multipart form data
+├─ Max 5 MB file size
+└─ Auth: Bearer JWT
+
+GET /api/v1/users/kyc/my-documents
+├─ List authenticated user's documents
+├─ Auth: Bearer JWT
+└─ Returns: Document metadata
+
+GET /api/v1/users/kyc/document-url/{documentId}
+├─ Get temporary access URL to document
+├─ Pre-signed S3 URL (15 min expiry)
+├─ Auth: Bearer JWT
+└─ Secure temporary access
+
+GET /api/v1/users/kyc-status
+├─ Get authenticated user's KYC status
+├─ Auth: Bearer JWT
+└─ Returns: PENDING, UNDER_REVIEW, APPROVED, REJECTED
+
+GET /api/v1/users/kyc-status/{userId}
+├─ Internal service-to-service API
+├─ Used by Account Service
+├─ No auth required (trust ECS SG)
+└─ Returns: boolean (is KYC approved?)
+
+Admin Endpoints:
+GET  /api/v1/users/kyc/admin/pending
+├─ List all users in UNDER_REVIEW status
+└─ Auth: ROLE_ADMIN
+
+GET  /api/v1/users/kyc/admin/users?status=APPROVED
+├─ Filter users by KYC status
+└─ Status: PENDING, UNDER_REVIEW, APPROVED, REJECTED
+
+POST /api/v1/users/kyc/admin/review/{userId}
+├─ Admin approves or rejects KYC
+├─ Payload: {"status":"APPROVED"} or {"status":"REJECTED"}
+└─ Auth: ROLE_ADMIN
+```
+
+---
+
+## S3 Document Storage
+
+### Definition
+
+**S3 (Simple Storage Service)** is AWS's object storage. User Service stores KYC documents in S3 for secure, scalable document management.
+
+### What You Implemented
+
+**S3 Configuration:**
+
+```yaml
+AWS:
+  Region: ap-south-1
+  S3 Bucket: citicore-kyc-docs
+
+Document Key Structure:
+kyc/{authUserId}/{documentType}/{UUID}_{originalFilename}
+
+Example:
+kyc/42/AADHAAR/f3a1b2c4_aadhaar_front.jpg
+
+Benefits:
+├─ Organized by user and document type
+├─ UUID prevents name collisions
+├─ Preserves original filename for reference
+└─ Easy to clean up by user ID
+```
+
+**S3 Client Setup (AWS SDK v2):**
+
+```java
+@Configuration
+public class S3Configuration {
+    
+    @Bean
+    public S3Client s3Client() {
+        return S3Client.builder()
+            .region(Region.AP_SOUTH_1)
+            .build();
+    }
+    
+    @Bean
+    public S3Presigner s3Presigner() {
+        return S3Presigner.builder()
+            .region(Region.AP_SOUTH_1)
+            .build();
+    }
+}
+```
+
+### KYC Upload Flow
+
+**Request:**
+
+```bash
+curl -X POST http://user-alb:8082/api/v1/users/kyc/upload \
+  -H "Authorization: Bearer <JWT>" \
+  -F "documentType=AADHAAR" \
+  -F "file=@aadhaar_front.jpg"
+```
+
+**Implementation:**
+
+```java
+@PostMapping("/upload")
+@PreAuthorize("isAuthenticated()")
+public ResponseEntity<DocumentResponse> uploadDocument(
+    @RequestParam String documentType,
+    @RequestParam MultipartFile file,
+    Authentication auth) throws IOException {
+    
+    String userId = ((JwtUserPrincipal) auth.getPrincipal()).getId();
+    
+    // Validate file
+    validateFile(file);
+    
+    // Generate S3 key
+    String uuid = UUID.randomUUID().toString();
+    String s3Key = String.format(
+        "kyc/%s/%s/%s_%s",
+        userId,
+        documentType,
+        uuid,
+        file.getOriginalFilename()
+    );
+    
+    // Upload to S3
+    s3Client.putObject(
+        PutObjectRequest.builder()
+            .bucket("citicore-kyc-docs")
+            .key(s3Key)
+            .build(),
+        RequestBody.fromInputStream(
+            file.getInputStream(),
+            file.getSize())
+    );
+    
+    // Save metadata to database
+    KycDocument doc = new KycDocument();
+    doc.setUserId(userId);
+    doc.setDocumentType(documentType);
+    doc.setS3Key(s3Key);
+    doc.setStatus(DocumentStatus.PENDING);
+    kycDocumentRepository.save(doc);
+    
+    // Update KYC status
+    updateKycStatus(userId, KycStatus.UNDER_REVIEW);
+    
+    // Publish event
+    publishKycEvent(userId, KycStatus.UNDER_REVIEW);
+    
+    return ResponseEntity
+        .status(HttpStatus.CREATED)
+        .body(new DocumentResponse(doc));
+}
+```
+
+### Pre-Signed S3 URL
+
+**Purpose:** Generate temporary URL allowing clients to download documents without exposing AWS credentials.
+
+**Request:**
+
+```bash
+curl -X GET \
+  http://user-alb:8082/api/v1/users/kyc/document-url/doc-123 \
+  -H "Authorization: Bearer <JWT>"
+```
+
+**Implementation:**
+
+```java
+@GetMapping("/document-url/{documentId}")
+@PreAuthorize("isAuthenticated()")
+public ResponseEntity<String> getDocumentUrl(
+    @PathVariable String documentId,
+    Authentication auth) {
+    
+    String userId = ((JwtUserPrincipal) auth.getPrincipal()).getId();
+    
+    // Fetch document
+    KycDocument doc = kycDocumentRepository.findById(documentId)
+        .orElseThrow(() -> new DocumentNotFoundException());
+    
+    // Verify ownership
+    if (!doc.getUserId().equals(userId)) {
+        throw new UnauthorizedException("Not your document");
+    }
+    
+    // Generate pre-signed URL (15 minute expiry)
+    GetObjectPresignRequest presignRequest = GetObjectPresignRequest.builder()
+        .getObjectRequest(GetObjectRequest.builder()
+            .bucket("citicore-kyc-docs")
+            .key(doc.getS3Key())
+            .build())
+        .signatureDuration(Duration.ofMinutes(15))
+        .build();
+    
+    PresignedGetObjectRequest presignedRequest = s3Presigner.presignGetObject(presignRequest);
+    String presignedUrl = presignedRequest.url().toString();
+    
+    return ResponseEntity.ok(presignedUrl);
+}
+```
+
+**Returned URL:**
+
+```
+https://citicore-kyc-docs.s3.ap-south-1.amazonaws.com/kyc/42/AADHAAR/f3a1b2c4_aadhaar_front.jpg?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=...&X-Amz-Expires=900&...
+
+Features:
+├─ Time-limited (900 seconds = 15 minutes)
+├─ Cryptographically signed
+├─ No AWS credentials exposed
+├─ Client can download without auth
+└─ Automatically expires after 15 minutes
+```
+
+---
+
+## Kafka Event Publishing
+
+### Definition
+
+**Kafka Events** publish KYC status changes asynchronously, decoupling User Service from Notification Service.
+
+### What You Implemented
+
+**KYC Event Publishing:**
+
+```java
+@Component
+public class KafkaProducerService {
+    
+    @Autowired
+    private KafkaTemplate<String, String> kafkaTemplate;
+    
+    private static final String KYC_TOPIC = "kyc-topic";
+    
+    public void publishKycEvent(
+        String userId,
+        String email,
+        KycStatus status) {
+        
+        // Create event
+        KycEvent event = new KycEvent();
+        event.setUserId(userId);
+        event.setEmail(email);
+        event.setStatus(status);
+        event.setTimestamp(System.currentTimeMillis());
+        
+        // Serialize to JSON
+        String eventJson = objectMapper.writeValueAsString(event);
+        
+        // Publish to Kafka
+        kafkaTemplate.send(KYC_TOPIC, userId, eventJson);
+        
+        logger.info("Published KYC event: userId={}, status={}", userId, status);
+    }
+}
+```
+
+**Producer Configuration:**
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: 10.0.1.87:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all                    # Wait for all replicas
+      enable.idempotence: true     # Prevent duplicates
+      retries: 10
+      retry.backoff.ms: 1000
+```
+
+### Event Flow
+
+```
+User uploads KYC document
+          ↓
+User Service saves to S3
+          ↓
+User Service updates MySQL (status = UNDER_REVIEW)
+          ↓
+User Service publishes KycEvent to Kafka
+          ↓
+KycEvent in kyc-topic
+          ↓
+Notification Service consumes event
+          ↓
+Notification Service sends email
+```
+
+### Consumer Configuration (Notification Service)
+
+```yaml
+spring:
+  kafka:
+    consumer:
+      bootstrap-servers: 10.0.1.87:9092
+      group-id: notification-group
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      enable.auto.commit: false    # Manual commit
+      auto.offset.reset: earliest  # Start from beginning if no offset
+```
+
+---
+
+## JWT Authentication
+
+### Definition
+
+**JWT (JSON Web Token)** is a cryptographic token authenticating users. It encodes user information signed by the Auth Service, verified by User Service without accessing Auth Service.
+
+### JWT Structure
+
+```
+JWT Token Format: header.payload.signature
+
+Example:
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.
+eyJzdWIiOiIxMjMiLCJuYW1lIjoiSm9obiBEb2UiLCJpYXQiOjE1MTYyMzkwMjJ9.
+SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+
+Header:
+{
+  "alg": "HS256",
+  "typ": "JWT"
+}
+
+Payload:
+{
+  "sub": "123",
+  "email": "user@example.com",
+  "roles": ["ROLE_USER"],
+  "iat": 1516239022,
+  "exp": 1516325422
+}
+
+Signature:
+HMACSHA256(header.payload, secret)
+```
+
+### User Service JWT Verification
+
+```java
+@Component
+public class JwtTokenProvider {
+    
+    @Value("${jwt.secret}")
+    private String jwtSecret;
+    
+    @Value("${jwt.expiration}")
+    private long jwtExpiration;
+    
+    public String validateAndGetUserId(String token) {
+        try {
+            // Parse and verify JWT
+            Claims claims = Jwts.parserBuilder()
+                .setSigningKey(Keys.hmacShaKeyFor(
+                    jwtSecret.getBytes(StandardCharsets.UTF_8)))
+                .build()
+                .parseClaimsJws(token)
+                .getBody();
+            
+            // Extract user ID
+            return claims.getSubject();
+        } catch (JwtException | IllegalArgumentException e) {
+            throw new InvalidJwtException("Invalid JWT token");
+        }
+    }
+}
+
+@Component
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+    
+    @Autowired
+    private JwtTokenProvider tokenProvider;
+    
+    @Override
+    protected void doFilterInternal(
+        HttpServletRequest request,
+        HttpServletResponse response,
+        FilterChain filterChain) {
+        
+        try {
+            String jwt = extractJwtFromRequest(request);
+            if (jwt != null) {
+                String userId = tokenProvider.validateAndGetUserId(jwt);
+                
+                // Create authentication
+                UserPrincipal principal = new UserPrincipal(userId);
+                Authentication auth = new UsernamePasswordAuthenticationToken(
+                    principal, null, principal.getAuthorities());
+                
+                SecurityContextHolder.getContext().setAuthentication(auth);
+            }
+        } catch (Exception e) {
+            logger.error("JWT verification failed: {}", e.getMessage());
+        }
+        
+        filterChain.doFilter(request, response);
+    }
+}
+```
+
+### Usage in User Service
+
+**Profile Endpoint with JWT Auth:**
+
+```java
+@GetMapping("/profile")
+@PreAuthorize("isAuthenticated()")
+public ResponseEntity<ProfileResponse> getProfile() {
+    // Get authenticated user from SecurityContext
+    Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+    UserPrincipal principal = (UserPrincipal) auth.getPrincipal();
+    String userId = principal.getId();
+    
+    // Fetch profile
+    UserProfile profile = userProfileRepository
+        .findByUserId(userId)
+        .orElseThrow(() -> new ProfileNotFoundException());
+    
+    return ResponseEntity.ok(new ProfileResponse(profile));
+}
+```
+
+**Request with JWT:**
+
+```bash
+curl -X GET http://user-alb:8082/api/v1/users/profile \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...."
+```
+
+---
+
+## Real Issues & Solutions
+
+### Issue #1: ECR Repository Not Found
+
+**Problem:**
+
+```
+Error: RepositoryNotFoundException
+Message: The repository with name 'citicore/user-service' does not exist in the registry
+```
+
+**Root Cause:**
+
+```
+Attempted to push Docker image to non-existent ECR repository.
+ECR doesn't auto-create repositories.
+Repository must be created before pushing.
+```
+
+**Solution:**
+
+```bash
+# Create repository first
+aws ecr create-repository \
+  --repository-name citicore/user-service \
+  --region ap-south-1
+
+# Then push image
+docker push 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/user-service:1.0
+```
+
+### Issue #2: Target Group Zero Targets
+
+**Problem:**
+
+```
+Total Targets: 0
+No tasks registered with ALB target group.
+Traffic cannot be routed anywhere.
+```
+
+**Root Cause:**
+
+```
+ECS task was running, but its IP was not registered with target group.
+Manual registration required during deployment.
+```
+
+**Solution:**
+
+```bash
+# Register task IP with target group
+aws elbv2 register-targets \
+  --target-group-arn arn:aws:elasticloadbalancing:...:targetgroup/citicore-user-tg/... \
+  --targets Id=10.0.1.81,Port=8082
+
+# Verify
+aws elbv2 describe-target-health \
+  --target-group-arn arn:aws:elasticloadbalancing:...
+
+# Status: draining → healthy
+```
+
+### Issue #3: Target Health Timeout
+
+**Problem:**
+
+```
+Target Health Status: Unhealthy
+Reason: Request timed out
+```
+
+**Investigation Process:**
+
+```
+Step 1: Check ECS task
+├─ Task running: ✓
+├─ Port 8082 listening: ✓
+└─ Application healthy: ✓
+
+Step 2: Check ECS security group
+├─ Rule for port 8082: ✓
+├─ Source is ALB SG: ✓
+└─ ECS SG rules correct: ✓
+
+Step 3: Check ALB security group
+├─ Rule for port 8082: ✗ MISSING
+├─ ALB cannot accept inbound traffic
+└─ Problem found!
+```
+
+**Root Cause:**
+
+```
+ALB security group (citicore-alb-sg) lacked inbound rule for port 8082.
+Internet → ALB on 8082 was blocked.
+Connection timeout because request never reached ALB.
+```
+
+**Solution:**
+
+```bash
+# Add inbound rule to ALB security group
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-09208846c8786e541 \
+  --protocol tcp \
+  --port 8082 \
+  --cidr 0.0.0.0/0 \
+  --description "User Service ALB HTTP"
+
+# Result: Target health becomes healthy within 30 seconds
+```
+
+### Issue #4: Redis Health Check Failure
+
+**Problem:**
+
+```
+Actuator health endpoint returns: DOWN
+Reason: redis: DOWN
+Error: RedisConnectionFailureException
+```
+
+**Analysis:**
+
+```
+Components:
+├─ db: UP ✓ (MySQL)
+├─ clientConfigServer: UP ✓ (Config Server)
+├─ discoveryComposite: UP ✓ (Eureka)
+├─ binders: UP ✓ (Kafka)
+└─ redis: DOWN ✗ (not deployed)
+
+Overall Status: DOWN
+Cause: Any component DOWN = overall DOWN
+```
+
+**Root Cause:**
+
+```
+Redis not deployed/configured.
+Health check tries to connect: fails.
+Overall health becomes DOWN despite APIs working.
+```
+
+**Solutions (Pick one):**
+
+```
+Option 1: Deploy Redis
+├─ Deploy Redis on EC2 or ElastiCache
+├─ Configure REDIS_HOST environment variable
+├─ Redis health check passes
+└─ Overall health becomes UP
+
+Option 2: Disable Redis health check
+├─ Add to Config Server:
+│  management:
+│    health:
+│      redis:
+│        enabled: false
+├─ Redis component not checked
+└─ Overall health depends on other components
+```
+
+---
+
+## Security Best Practices
+
+### Secrets Management
+
+```
+DO NOT DO THIS:
+├─ Hardcode passwords in application.yml
+├─ Commit JWT_SECRET to Git
+├─ Include AWS credentials in Docker image
+├─ Store keys in environment variables (shell history)
+└─ Share credentials in tickets/messages
+
+DO THIS INSTEAD:
+├─ AWS Secrets Manager stores credentials
+├─ Task definition references ARNs
+├─ ECS injects secrets at runtime
+├─ No secrets in logs/history
+└─ Credentials never visible to developers
+```
+
+### Database Security
+
+```
+Use environment variables:
+├─ DB_HOST
+├─ DB_USERNAME
+├─ DB_PASSWORD
+
+ECS injects at runtime:
+├─ From Secrets Manager (for passwords)
+├─ From environment (for non-sensitive)
+└─ Application never hardcodes values
+
+Example configuration:
+spring:
+  datasource:
+    url: jdbc:mysql://${DB_HOST}:3306/citicore_userdb
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+```
+
+### S3 Access
+
+```
+Best Practice: Task IAM Role
+├─ Create IAM role for ECS task
+├─ Add S3 permissions to role
+├─ Attach role to task
+├─ Application assumes role (no explicit credentials)
+└─ Credentials auto-rotated by AWS
+
+Current (OK): Environment variables
+├─ AWS_ACCESS_KEY_ID
+├─ AWS_SECRET_ACCESS_KEY
+├─ Stored in Secrets Manager
+├─ Manually rotated
+└─ Better than hardcoding, but manual rotation required
+
+Future: Complete IAM role assumption
+└─ No need for explicit credentials
+```
+
+### ALB Security
+
+```
+External Access:
+├─ Internet → ALB: 0.0.0.0/0 allowed
+└─ Public, as intended (API endpoint)
+
+Internal Access:
+├─ ALB → ECS task: via security group
+├─ Only ALB SG can reach ECS
+├─ ECS tasks not directly exposed
+└─ Protected by security group rules
+
+Pattern:
+Internet
+   │
+   ├→ Allowed
+   │
+ALB
+   │
+   ├→ Only ALB SG can reach
+   │
+ECS Task
+   │
+   └─ Not directly accessible from internet
+```
+
+---
+
+## Interview-Ready Explanations
+
+### "Walk me through the User Service deployment"
+
+**Response:**
+
+"User Service is a multifaceted microservice managing user profiles and KYC verification for banking onboarding.
+
+**Architecture layers:**
+
+1. **Containerization**: Java 17 Spring Boot application packaged in Docker. Maven builds 160 MB JAR with all dependencies (Spring Cloud, AWS SDK, Kafka, Security, etc.).
+
+2. **Image Registry**: Docker image pushed to Amazon ECR. I encountered an issue where the ECR repository didn't exist—learned that repositories must be created before pushing.
+
+3. **ECS Deployment**: Task definition specifies 1 vCPU, 3 GB memory, port 8082. Environment variables from ECS, sensitive values from AWS Secrets Manager.
+
+4. **Load Balancing**: Internet-facing ALB receives traffic on port 8082, routes to User Service via target group. I fixed an ALB security group issue where the listener port wasn't accepting inbound traffic from internet.
+
+5. **Service Integration**: User Service registers with Eureka (service discovery), fetches config from Config Server (Git-backed), connects to RDS MySQL, publishes KYC events to Kafka, stores documents in S3.
+
+6. **API Layers**: 
+   - User profiles (create, read, update) with JWT authentication
+   - KYC workflows (upload, review, approve)
+   - S3 integration with pre-signed URLs for secure document access
+   - Kafka producer publishes status changes for Notification Service
+
+**Key achievement**: All core dependencies verified—MySQL UP, Config Server UP, Eureka UP, Kafka UP, only Redis DOWN (not needed, can disable health check).
+
+**Lessons learned**: Check security groups carefully (ALB SG needs inbound rule), create ECR repo before pushing, health checks are component-based not all-or-nothing."
+
+### "How do you handle secure credential management?"
+
+**Response:**
+
+"Credentials never go into source code or environment variables on developer machines.
+
+**For User Service:**
+
+1. **Sensitive values stored in AWS Secrets Manager:**
+   - DB_PASSWORD
+   - JWT_SECRET
+   - AWS_SECRET_ACCESS_KEY
+
+2. **ECS task definition references ARNs:**
+   - `ValueFrom: arn:aws:secretsmanager:...:secret:citicore/auth-service/database-tXq98R:DB_PASSWORD::`
+
+3. **Runtime behavior:**
+   - ECS injects values into container environment
+   - Application reads from environment variables
+   - Never sees or stores the actual values
+   - Secrets never appear in logs
+
+**For S3 access:**
+   - Current: AWS credentials in Secrets Manager
+   - Future: Task IAM role with S3 permissions (better—auto-rotating)
+
+**For application code:**
+   - Spring Security with JWT tokens
+   - Passwords hashed with bcrypt
+   - Sensitive data never logged
+
+**Pattern:**
+   Dev writes code with `${JWT_SECRET}` placeholder
+   → Git stores only placeholder
+   → At deploy time, ECS injects actual value
+   → Container runs with credentials injected
+   → Result: Developers never touch actual secrets"
+
+### "How would you scale User Service to millions of users?"
+
+**Response:**
+
+"Currently: Single instance with manual IP registration. For millions of users:
+
+**Compute scaling:**
+1. ECS Service with desired count = N
+2. Auto Scaling Group scales based on CPU/memory metrics
+3. Each instance runs User Service independently
+4. Load balancer distributes across instances
+
+**Database scaling:**
+1. Current: Single RDS instance
+2. For scale: Read replicas + read-write routing
+3. Account Service has this already—apply pattern to User Service
+4. Shard by user ID for massive scale
+
+**S3 for KYC documents:**
+1. Already scales horizontally (S3 design)
+2. No code changes needed
+3. Millions of documents handled automatically
+
+**Kafka partitioning:**
+1. Current: Single partition kyc-topic
+2. For scale: Multiple partitions (e.g., 10)
+3. Partition by userId for ordering per user
+4. Notification Service consumer group parallelize
+
+**Caching (Redis):**
+1. Currently skipped (health DOWN)
+2. For scale: Enable caching
+3. Cache frequently accessed profiles
+4. Invalidate on updates
+
+**Database indexes:**
+1. Index by user_id (lookups)
+2. Index by kyc_status (admin queries)
+3. Index by created_at (audit)
+
+**Monitoring & alerting:**
+1. Prometheus metrics on all instances
+2. CloudWatch dashboards per instance + aggregate
+3. Alert if any instance unhealthy
+4. Alert if Kafka lag > threshold
+
+**API rate limiting:**
+1. Per-user rate limits
+2. Admin endpoints rate limited stricter
+3. Prevent DoS attacks
+
+**Result:**
+   Dev instances: 1-2 replicas sufficient
+   Staging: 3-5 replicas
+   Production: 10-50+ replicas auto-scaled
+   All served by same Docker image
+   Credentials managed by Secrets Manager
+   No code changes for scaling"
+
+---
+
+## Key Takeaways
+
+```
+✅ Complete Microservice Deployment
+   From source code to production ALB
+   All infrastructure verified
+
+✅ Security Layers
+   Secrets Manager for credentials
+   ALB for external traffic control
+   Security groups for internal routing
+   JWT for user authentication
+
+✅ Event-Driven Architecture
+   Kafka publishes KYC changes
+   Notification Service consumes asynchronously
+   Decoupled services
+
+✅ Cloud Storage Integration
+   S3 for scalable document storage
+   Pre-signed URLs for secure access
+   No AWS credentials exposed
+
+✅ Real Issues & Solutions
+   Security group debugging
+   ECR repository creation
+   Health check configuration
+
+✅ Multi-Layer Architecture
+   ECS for compute
+   ALB for load balancing
+   RDS for data
+   S3 for documents
+   Kafka for events
+   Eureka for discovery
+   Config Server for centralization
+```
+
+---
