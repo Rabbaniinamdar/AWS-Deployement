@@ -15737,3 +15737,3339 @@ ECS Task
 ```
 
 ---
+
+# CitiCore Transaction Service - AWS ECS Deployment Comprehensive Notes
+
+**Complete guide to deploying Transaction Service on AWS ECS Fargate with saga orchestration, transactional outbox pattern, Kafka event handling, and cross-service communication.**
+
+---
+
+## Table of Contents
+
+1. [Transaction Service Role](#transaction-service-role)
+2. [Architecture Overview](#architecture-overview)
+3. [Core Technology Stack](#core-technology-stack)
+4. [Application Configuration](#application-configuration)
+5. [Database Configuration](#database-configuration)
+6. [ECS Task Definition](#ecs-task-definition)
+7. [Docker & ECR Deployment](#docker--ecr-deployment)
+8. [ECS Networking](#ecs-networking)
+9. [Secrets Manager Integration](#secrets-manager-integration)
+10. [IAM Roles & Permissions](#iam-roles--permissions)
+11. [Kafka Event Architecture](#kafka-event-architecture)
+12. [Kafka Serialization Strategy](#kafka-serialization-strategy)
+13. [Transactional Outbox Pattern](#transactional-outbox-pattern)
+14. [Event Consumers](#event-consumers)
+15. [Kafka Retry & Dead Letter Queue](#kafka-retry--dead-letter-queue)
+16. [OpenFeign Service Communication](#openfeign-service-communication)
+17. [Authorization Propagation](#authorization-propagation)
+18. [Business Limits & Validation](#business-limits--validation)
+19. [Application Load Balancer](#application-load-balancer)
+20. [Security Group Configuration](#security-group-configuration)
+21. [Real Issues & Solutions](#real-issues--solutions)
+22. [Troubleshooting Methodology](#troubleshooting-methodology)
+23. [End-to-End Transaction Saga](#end-to-end-transaction-saga)
+24. [Deployment Validation](#deployment-validation)
+25. [Interview-Ready Explanations](#interview-ready-explanations)
+
+---
+
+## Transaction Service Role
+
+### Definition
+
+**Transaction Service** orchestrates financial transactions between accounts using the Saga pattern, coordinating with Account Service to debit and credit accounts while maintaining transactional consistency through Kafka-based event choreography.
+
+### What You Implemented
+
+```
+Core Responsibilities:
+
+1. Transaction Orchestration
+   ├─ Validate transfer request
+   ├─ Call Account Service to validate
+   ├─ Initiate debit on sender account
+   ├─ Initiate credit on receiver account
+   └─ Update transaction state based on results
+
+2. Event-Driven Saga
+   ├─ Listen for Account Service events
+   ├─ Handle credit success/failure
+   ├─ Handle debit success/failure
+   ├─ Initiate reversals if needed
+   └─ Update transaction status
+
+3. Service Orchestration
+   ├─ OpenFeign calls to Account Service
+   ├─ JWT propagation for authorization
+   ├─ Timeout handling (3s connect, 5s read)
+   └─ Fallback strategies
+
+4. Durable Event Publishing
+   ├─ Transactional outbox pattern
+   ├─ Kafka reliability guarantees
+   ├─ Automatic retry on failure
+   ├─ Dead letter queue handling
+   └─ Event audit trail
+```
+
+---
+
+## Architecture Overview
+
+### High-Level Flow
+
+```
+Client Request
+      ↓
+Transaction Service :8084
+      ├─ Validate transfer
+      ├─ Call Account Service (OpenFeign)
+      ├─ Save to Transaction DB
+      ├─ Write to outbox table
+      ↓
+OutboxPublisher (polls every 5s)
+      ├─ Find PENDING events
+      ├─ Publish to Kafka
+      ├─ Mark as SENT
+      ↓
+Kafka (event-driven)
+      ├─ credit-topic
+      ├─ debit-topic
+      ├─ reversal-topic
+      ↓
+Account Service (consumer)
+      ├─ Debit sender account
+      ├─ Credit receiver account
+      ├─ Publish result events
+      ↓
+Transaction Service (result consumer)
+      ├─ Listen credit-success-topic
+      ├─ Listen credit-failed-topic
+      ├─ Update transaction status
+      ├─ Initiate reversal if needed
+      ↓
+Final Transaction State
+└─ COMPLETED / FAILED / REVERSED
+```
+
+### Why This Architecture
+
+```
+✅ Asynchronous Processing
+   ├─ Client doesn't wait for Account Service
+   ├─ Improves perceived performance
+   └─ Decouples services
+
+✅ Failure Recovery
+   ├─ Can retry failed events
+   ├─ Dead letter queue for inspection
+   └─ Manual intervention possible
+
+✅ Consistency Guarantees
+   ├─ Transactional outbox
+   ├─ No dual-write problem
+   └─ Banking-grade reliability
+
+✅ Auditability
+   ├─ Complete event trail
+   ├─ State transitions logged
+   └─ Regulatory compliance
+```
+
+---
+
+## Core Technology Stack
+
+### What You Implemented
+
+```
+Java 17
+├─ LTS version
+├─ Latest Spring compatibility
+└─ Matches organization standard
+
+Spring Boot 3.2.4
+├─ Fast startup
+├─ Low memory footprint
+└─ Production-ready
+
+Spring Cloud 2023.0.3
+├─ Service discovery (Eureka)
+├─ Config server client
+├─ Circuit breaker patterns
+└─ Version alignment
+
+Spring Data JPA
+├─ Transaction entity mapping
+├─ Custom queries
+└─ Repository pattern
+
+Spring Kafka
+├─ Event listeners
+├─ Consumer groups
+├─ Dead letter handling
+└─ Producer configuration
+
+Spring Cloud OpenFeign
+├─ Declarative HTTP client
+├─ Service-to-service calls
+├─ Automatic retries
+└─ Timeout handling
+
+Spring Security & JWT
+├─ OAuth/JWT tokens
+├─ Method-level authorization
+├─ Request propagation
+└─ Feign interceptors
+
+Micrometer Prometheus
+├─ Metrics collection
+├─ Health checks
+└─ Monitoring integration
+
+SendGrid & Spring Mail
+├─ Email notifications
+├─ Async delivery
+└─ Failure tracking
+
+CitiCore kafka-events
+├─ Shared event definitions
+├─ Serialization logic
+└─ Type safety
+```
+
+---
+
+## Application Configuration
+
+### Server Configuration
+
+```yaml
+server:
+  port: 8084
+  address: 0.0.0.0
+  servlet:
+    context-path: /
+
+spring:
+  application:
+    name: transaction-service
+```
+
+### Config Server Integration
+
+```yaml
+spring:
+  config:
+    import: optional:configserver:http://citicore-config-alb-1654378622.ap-south-1.elb.amazonaws.com
+
+Configuration files loaded:
+├─ application.yml (shared)
+└─ transaction-service.yml (service-specific)
+```
+
+### OpenFeign Configuration
+
+```yaml
+spring:
+  cloud:
+    openfeign:
+      client:
+        config:
+          account-service:
+            connect-timeout: 3000  # 3 seconds
+            read-timeout: 5000     # 5 seconds
+```
+
+### Task Scheduling
+
+```yaml
+spring:
+  task:
+    scheduling:
+      pool:
+        size: 2
+```
+
+**Used by:** OutboxPublisher runs scheduled tasks to poll database for PENDING events.
+
+---
+
+## Database Configuration
+
+### Connection String
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:mysql://${TRANSACTION_DB_HOST}:3306/citicore_transactiondb
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+```
+
+### Critical Environment Variables
+
+```
+TRANSACTION_DB_HOST
+├─ RDS endpoint
+├─ Example: transaction-db.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com
+└─ Must be specific transaction database, not auth database
+
+DB_USERNAME
+├─ RDS user (transaction-specific)
+└─ Different from auth service user
+
+DB_PASSWORD
+├─ Stored in AWS Secrets Manager
+└─ Never in application.yml
+```
+
+### Previous Mistake (Don't Repeat)
+
+```
+❌ Wrong:
+AUTH_DB_HOST used for Transaction Service
+└─ Transaction Service connects to Auth database
+└─ Database access cross-service
+
+✅ Correct:
+TRANSACTION_DB_HOST for Transaction Service
+├─ Transaction Service connects to transaction database
+├─ Database isolation
+└─ Security boundary
+```
+
+### Database Tables
+
+```
+Conceptual structure:
+
+transactions
+├─ id (UUID)
+├─ sender_account
+├─ receiver_account
+├─ amount
+├─ type (TRANSFER, DEPOSIT, WITHDRAWAL)
+├─ status (PENDING, DEBIT_INITIATED, CREDIT_SUCCESS, FAILED, REVERSED)
+├─ created_at
+└─ updated_at
+
+outbox_events
+├─ id (auto-increment)
+├─ transaction_id
+├─ event_type (DEBIT, CREDIT, REVERSAL)
+├─ payload (JSON)
+├─ status (PENDING, SENT, FAILED)
+├─ created_at
+└─ published_at
+
+dead_letter_events
+├─ id
+├─ topic
+├─ partition
+├─ offset
+├─ payload (JSON)
+├─ error_message
+└─ exception_class
+```
+
+### Database Error You Encountered
+
+```
+Error:
+java.sql.SQLSyntaxErrorException:
+Unknown database 'citicore_transactiondb'
+
+Cause:
+├─ RDS reachable ✓
+├─ MySQL connection successful ✓
+├─ Database not created ✗
+
+Fix:
+mysql> CREATE DATABASE citicore_transactiondb;
+mysql> USE citicore_transactiondb;
+
+This shows progression:
+└─ Network issue (would fail earlier)
+└─ Authentication issue (would fail earlier)
+└─ Database schema issue (exactly where it failed)
+```
+
+---
+
+## ECS Task Definition
+
+### Configuration
+
+```yaml
+Family: citicore-transaction-service
+
+Compute:
+  Launch Type: FARGATE
+  OS: Linux
+  Architecture: X86_64
+  Network Mode: awsvpc
+  CPU: 0.5 vCPU
+  Memory: 1 GiB
+  
+Ephemeral Storage:
+  20 GiB
+
+Container:
+  Name: citicore-transaction-service
+  Image: 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/transaction-service:1.0
+  Port Mapping: 8084:8084/TCP
+  
+IAM Roles:
+  Task Role: citicore-ecs-task-role
+  Execution Role: citicore-ecs-task-execution-role
+  
+Logging:
+  Driver: awslogs
+  Log group: /ecs/citicore-transaction-service
+  Region: ap-south-1
+```
+
+### Resource Sizing Rationale
+
+```
+CPU: 0.5 vCPU
+├─ Transaction processing: moderate compute
+├─ OpenFeign calls: mostly I/O wait
+├─ Kafka publishing: light
+├─ Database queries: I/O bound
+└─ Single instance adequate
+
+Memory: 1 GB
+├─ Spring Boot base: ~200 MB
+├─ Spring Cloud libraries: ~300 MB
+├─ Spring Data JPA: ~100 MB
+├─ Kafka: ~100 MB
+├─ OpenFeign: ~50 MB
+├─ Application state: ~100 MB
+├─ Safety margin: ~150 MB
+└─ Total: ~1000 MB
+```
+
+---
+
+## Docker & ECR Deployment
+
+### Build Pipeline
+
+```
+Source Code
+    ↓
+Maven: mvn clean package -DskipTests
+    ↓
+JAR: transaction-service-0.0.1-SNAPSHOT.jar
+    ↓
+Docker: docker build -t citicore/transaction-service:1.0 .
+    ↓
+Dockerfile:
+    FROM eclipse-temurin:17-jre
+    WORKDIR /app
+    COPY target/transaction-service-0.0.1-SNAPSHOT.jar app.jar
+    EXPOSE 8084
+    ENTRYPOINT ["java", "-jar", "app.jar"]
+    ↓
+ECR: Push to AWS Container Registry
+    ↓
+Image URI: 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/transaction-service:1.0
+    ↓
+ECS: Reference in task definition
+```
+
+### ECR Authentication
+
+```bash
+# Get ECR login token
+aws ecr get-login-password --region ap-south-1 | \
+  docker login --username AWS --password-stdin \
+  580655778303.dkr.ecr.ap-south-1.amazonaws.com
+
+# Tag image
+docker tag citicore/transaction-service:1.0 \
+  580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/transaction-service:1.0
+
+# Push to ECR
+docker push 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/transaction-service:1.0
+```
+
+---
+
+## ECS Networking
+
+### Observed Configuration
+
+```
+Network Mode: awsvpc
+├─ Each task gets Elastic Network Interface (ENI)
+├─ Example ENI: eni-0c5467f4770229d89
+
+Private IP: 10.0.1.80
+├─ Ephemeral (changes on task replacement)
+├─ Within VPC CIDR: 10.0.0.0/16
+
+Subnet: subnet-016646689621ec8d3
+├─ CIDR: 10.0.1.0/24
+├─ Availability Zone: ap-south-1a
+
+Route Table: rtb-09c71e4829928314f
+├─ 10.0.0.0/16 → local (VPC)
+├─ 0.0.0.0/0 → Internet Gateway (public subnet)
+
+Security Group: sg-0b8ac20679059c792 (citicore-ecs-sg)
+```
+
+### Why Private IP Matters
+
+```
+❌ Never hardcode:
+   http://10.0.1.80:8084
+   
+   Problem:
+   ├─ Task replaced → new IP: 10.0.2.150
+   ├─ Old routing breaks
+   └─ Service discovery fails
+
+✅ Use Service Connect DNS:
+   http://transaction-service-8084-tcp.citicore:8084
+   
+   Benefit:
+   ├─ Task IP changes
+   ├─ DNS stays same
+   └─ Routing always works
+```
+
+---
+
+## Secrets Manager Integration
+
+### What It Stores
+
+```
+Secrets Manager Secrets:
+
+citicore/transaction-service/database
+├─ username
+├─ password
+└─ host
+
+citicore/transaction-service/jwt
+└─ secret-key
+
+These are retrieved by the ECS execution role
+and injected as environment variables.
+```
+
+### IAM Execution Role Permissions
+
+```
+The execution role must allow:
+
+secretsmanager:GetSecretValue
+Resource:
+├─ arn:aws:secretsmanager:ap-south-1:580655778303:secret:citicore/transaction-service/database-*
+└─ arn:aws:secretsmanager:ap-south-1:580655778303:secret:citicore/transaction-service/jwt-*
+```
+
+### The Secrets Manager Timeout You Encountered
+
+**Error:**
+```
+ResourceInitializationError:
+unable to retrieve secret from asm:
+There is a connection issue between the task and AWS Secrets Manager
+context deadline exceeded
+```
+
+**What Happened:**
+
+```
+ECS task launched
+    ↓
+ENI attached to ECS SG
+    ↓
+Attempt to retrieve secrets from Secrets Manager
+    ↓
+❌ Network timeout (no route)
+
+Why:
+├─ Task in public subnet but no public IP
+├─ OR execution role lacks permissions
+├─ OR security group blocks outbound access
+├─ OR no NAT Gateway / VPC endpoint for Secrets Manager
+└─ OR Network ACL blocks traffic
+```
+
+**Solutions:**
+
+```
+Option 1: NAT Gateway
+├─ Private ECS subnet
+├─ NAT Gateway in public subnet
+├─ ECS outbound → NAT → Secrets Manager
+└─ Requires public IP/Internet Gateway
+
+Option 2: VPC Endpoint
+├─ Private ECS subnet
+├─ VPC Interface Endpoint for Secrets Manager
+├─ ECS outbound → VPC endpoint → Secrets Manager
+└─ Stays within AWS network
+```
+
+**Current Status:**
+```
+✅ Secrets Manager network access working
+✅ Database credentials retrieved
+✅ Application can access RDS
+```
+
+---
+
+## IAM Roles & Permissions
+
+### Task Execution Role
+
+```
+Role: citicore-ecs-task-execution-role
+
+Permissions:
+├─ ECR:GetDownloadUrlForLayer
+├─ ECR:BatchGetImage
+├─ ECR:PutImage
+├─ logs:CreateLogStream
+├─ logs:PutLogEvents
+├─ secretsmanager:GetSecretValue
+├─ kms:Decrypt
+└─ sts:AssumeRole
+
+Purpose:
+└─ ECS infrastructure operations
+   ├─ Pull Docker image from ECR
+   ├─ Create CloudWatch log streams
+   ├─ Retrieve secrets from Secrets Manager
+   └─ Decrypt encrypted secrets
+```
+
+### Task Role
+
+```
+Role: citicore-ecs-task-role
+
+Permissions:
+├─ s3:GetObject
+├─ s3:PutObject
+├─ sns:Publish
+├─ sqs:SendMessage
+└─ kms:Decrypt
+
+Purpose:
+└─ Application needs these when calling AWS APIs
+   ├─ Send SNS notifications
+   ├─ Enqueue to SQS
+   ├─ Access S3 (future)
+   └─ Decrypt data
+```
+
+### Key Distinction
+
+```
+Conceptually:
+
+ECS Infrastructure (docker daemon, task init)
+    ↓
+    Uses: Execution Role
+    └─ Pull image, get secrets, send logs
+
+Application Code (Spring Boot, Java threads)
+    ↓
+    Uses: Task Role
+    └─ Call AWS APIs, SNS, SQS, etc.
+```
+
+---
+
+## Kafka Event Architecture
+
+### Topics & Flow
+
+```
+Primary Topics:
+
+1. debit-topic
+   ├─ Published by: Transaction Service (outbox)
+   ├─ Consumed by: Account Service
+   ├─ Payload: Debit instruction
+   └─ Response: debit-success-topic / debit-failed-topic
+
+2. credit-topic
+   ├─ Published by: Transaction Service (outbox)
+   ├─ Consumed by: Account Service
+   ├─ Payload: Credit instruction
+   └─ Response: credit-success-topic / credit-failed-topic
+
+3. reversal-topic
+   ├─ Published by: Transaction Service (outbox, on failure)
+   ├─ Consumed by: Account Service
+   ├─ Payload: Reversal instruction
+   └─ Response: reversal-success-topic
+
+Result Topics:
+
+4. debit-success-topic
+   ├─ Published by: Account Service
+   ├─ Consumed by: Transaction Service
+   └─ Action: Mark transaction DEBIT_SUCCESS
+
+5. debit-failed-topic
+   ├─ Published by: Account Service
+   ├─ Consumed by: Transaction Service
+   └─ Action: Mark transaction FAILED
+
+6. credit-success-topic
+   ├─ Published by: Account Service
+   ├─ Consumed by: Transaction Service
+   └─ Action: Mark transaction COMPLETED / initiate reversal
+
+7. credit-failed-topic
+   ├─ Published by: Account Service
+   ├─ Consumed by: Transaction Service
+   ├─ Action: Mark transaction FAILED
+   └─ Action: Initiate reversal to undo debit
+
+8. reversal-success-topic
+   ├─ Published by: Account Service
+   ├─ Consumed by: Transaction Service
+   └─ Action: Mark transaction REVERSED
+```
+
+### Bootstrap Configuration
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
+    
+Environment variable: 10.0.1.87:9092
+├─ EC2 private IP where Kafka runs
+├─ NOT localhost (doesn't work in container)
+└─ NOT 127.0.0.1 (container's own loopback)
+```
+
+### Consumer Configuration
+
+```yaml
+Consumer Group: transaction-group
+
+Settings:
+├─ auto.offset.reset: earliest
+│  └─ Start from beginning if no offset exists
+├─ enable.auto.commit: false
+│  └─ Manual commit after processing
+└─ group.id: transaction-group
+   └─ Stable across restarts (avoid full replay)
+```
+
+---
+
+## Kafka Serialization Strategy
+
+### Definition
+
+**Serialization** converts Java objects to byte streams for Kafka transmission.
+
+### Two Producer Strategies You Implemented
+
+**1. JSON Producer (for dead letter queue)**
+
+```java
+@Configuration
+public class KafkaProducerConfig {
+    @Bean(name = "jsonKafkaTemplate")
+    public KafkaTemplate<String, Object> jsonKafkaTemplate(
+        ProducerFactory<String, Object> producerFactory) {
+        return new KafkaTemplate<>(producerFactory);
+    }
+}
+
+// Configuration
+@Bean
+public ProducerFactory<String, Object> producerFactory() {
+    Map<String, Object> configProps = new HashMap<>();
+    configProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,
+        StringSerializer.class);
+    configProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+        JsonSerializer.class);  // JsonSerializer
+    return new DefaultProducerFactory<>(configProps);
+}
+```
+
+**Used for:**
+```
+DeadLetterPublishingRecoverer
+└─ Failed messages to DLT topics
+└─ Events are deserialized objects
+└─ JsonSerializer converts to JSON bytes
+```
+
+**2. String Producer (for outbox)**
+
+```java
+@Bean(name = "stringKafkaTemplate")
+public KafkaTemplate<String, String> stringKafkaTemplate(
+    ProducerFactory<String, String> stringProducerFactory) {
+    return new KafkaTemplate<>(stringProducerFactory);
+}
+
+// Configuration
+@Bean
+public ProducerFactory<String, String> stringProducerFactory() {
+    Map<String, Object> configProps = new HashMap<>();
+    configProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,
+        StringSerializer.class);
+    configProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+        StringSerializer.class);  // StringSerializer
+    return new DefaultProducerFactory<>(configProps);
+}
+```
+
+**Used for:**
+```
+OutboxPublisher
+├─ Events stored as JSON strings in database
+├─ Read from outbox table as JSON string
+├─ StringSerializer: pass string as-is to Kafka
+└─ No double encoding
+
+vs.
+
+❌ Incorrect (JsonSerializer):
+Outbox JSON string
+    ↓
+JsonSerializer
+    ↓
+JSON-encoded again (double-encoding)
+    ↓
+Consumer receives invalid data
+```
+
+### Why String Serialization for Outbox
+
+```
+Correct Flow:
+
+Database (Outbox):
+{
+  "transactionId": "abc123",
+  "amount": 5000,
+  "type": "DEBIT"
+}
+
+↓ Read as String
+
+StringSerializer: takes string as-is
+├─ Bytes: { "transactionId": "abc123", ... }
+
+↓ Kafka
+
+Consumer:
+├─ Receives string
+├─ Parses JSON
+└─ Gets original object
+
+---
+
+Incorrect Flow:
+
+Database (Outbox):
+{
+  "transactionId": "abc123",
+  ...
+}
+
+↓ Read as String
+
+JsonSerializer: treats string as object to encode
+├─ Encodes: "\"{\"transactionId\": \"abc123\", ...}\""
+└─ Double-quoted, escaped
+
+↓ Kafka
+
+Consumer:
+├─ Receives: "\"{\"transactionId\": \"abc123\", ...}\""
+├─ Parses JSON: gets string containing JSON
+└─ Parse fails or gets wrong data
+```
+
+---
+
+## Transactional Outbox Pattern
+
+### Definition
+
+**Transactional Outbox Pattern** reliably publishes events from a database transaction using an outbox table, eliminating the dual-write problem.
+
+### What You Implemented
+
+```
+Problem without outbox:
+
+Transaction Service needs to:
+1. Update database
+2. Publish to Kafka
+
+But:
+├─ Update succeeds, publish fails → data loss
+├─ Publish succeeds, update fails → duplicate event
+└─ No atomicity across DB + Kafka
+
+Solution: Transactional Outbox
+
+1. Save business transaction
+2. Save event to outbox table
+   └─ Both in same DB transaction
+3. Separate process polls outbox
+4. Publish confirmed events to Kafka
+5. Mark as SENT in database
+```
+
+### Flow Diagram
+
+```
+Client Request
+    ↓
+Transaction Service
+    ├─ BEGIN TRANSACTION
+    │  ├─ INSERT into transactions
+    │  ├─ INSERT into outbox_events (status=PENDING)
+    │  └─ COMMIT
+    ↓
+OutboxPublisher (every 5 seconds)
+    ├─ SELECT * FROM outbox_events WHERE status = 'PENDING'
+    ├─ FOR each event:
+    │  ├─ PUBLISH to Kafka
+    │  ├─ await acknowledgement
+    │  ├─ UPDATE outbox SET status = 'SENT'
+    │  └─ COMMIT
+    ↓
+Kafka Event
+    ├─ Account Service receives
+    ├─ Processes debit/credit
+    ├─ Publishes result
+    ↓
+Transaction Service Result Consumer
+    ├─ Receives debit/credit result
+    ├─ Updates transaction status
+    └─ May publish reversal to outbox
+```
+
+### Outbox Table Schema
+
+```sql
+CREATE TABLE outbox_events (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  transaction_id VARCHAR(36),
+  event_type VARCHAR(50),
+  payload JSON,
+  status VARCHAR(20),  -- PENDING, SENT, FAILED
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  published_at TIMESTAMP,
+  FOREIGN KEY (transaction_id) REFERENCES transactions(id)
+);
+```
+
+### Publisher Implementation
+
+```java
+@Component
+public class OutboxPublisher {
+    
+    @Autowired
+    private OutboxEventRepository outboxRepository;
+    
+    @Autowired
+    private StringKafkaTemplate stringKafkaTemplate;
+    
+    @Scheduled(fixedRate = 5000)  // Every 5 seconds
+    public void publishPendingEvents() {
+        List<OutboxEvent> pending = outboxRepository
+            .findByStatus(OutboxStatus.PENDING);
+        
+        for (OutboxEvent event : pending) {
+            try {
+                // Publish to Kafka
+                ListenableFuture<SendResult<String, String>> future =
+                    stringKafkaTemplate.send(
+                        event.getEventType().getTopic(),
+                        event.getId().toString(),
+                        event.getPayload());
+                
+                // ⚠️ CRITICAL: Wait for acknowledgement
+                SendResult<String, String> result = future.get(5, TimeUnit.SECONDS);
+                
+                // Only mark SENT after Kafka acknowledges
+                event.setStatus(OutboxStatus.SENT);
+                event.setPublishedAt(LocalDateTime.now());
+                outboxRepository.save(event);
+                
+            } catch (Exception e) {
+                logger.error("Failed to publish event: {}", event.getId(), e);
+                // Mark as FAILED, can retry later or manual intervention
+                event.setStatus(OutboxStatus.FAILED);
+                outboxRepository.save(event);
+            }
+        }
+    }
+}
+```
+
+### Critical: Wait for Kafka Acknowledgement
+
+```
+❌ Wrong:
+stringKafkaTemplate.send(topic, payload);
+event.setStatus(SENT);  // Wrong! Sent is async
+
+Problem:
+├─ send() returns immediately
+├─ Kafka publish happens async
+├─ Event marked SENT before Kafka confirms
+├─ If Kafka fails, event lost forever
+└─ No retry, no recovery
+
+✅ Correct:
+ListenableFuture<SendResult> future = 
+    stringKafkaTemplate.send(topic, payload);
+SendResult result = future.get(5, TimeUnit.SECONDS);  // Block for ack
+event.setStatus(SENT);  // Now safe
+
+Benefit:
+├─ Blocks until Kafka acknowledges
+├─ Exception if timeout
+├─ Event status only SENT after confirmed
+├─ Banking-grade reliability
+```
+
+---
+
+## Event Consumers
+
+### Transaction Event Consumer
+
+```java
+@Component
+public class TransactionEventConsumer {
+    
+    @Autowired
+    private TransactionRepository transactionRepository;
+    
+    // Listen for credit success
+    @KafkaListener(topics = "credit-success-topic",
+                   groupId = "transaction-group")
+    public void handleCreditSuccess(String message) {
+        CreditEvent event = objectMapper.readValue(message, CreditEvent.class);
+        
+        Transaction txn = transactionRepository
+            .findById(event.getTransactionId())
+            .orElseThrow();
+        
+        txn.setStatus(TransactionStatus.COMPLETED);
+        transactionRepository.save(txn);
+        
+        logger.info("Transaction {} COMPLETED", txn.getId());
+    }
+    
+    // Listen for reversal success
+    @KafkaListener(topics = "reversal-success-topic",
+                   groupId = "transaction-group")
+    public void handleReversalSuccess(String message) {
+        ReversalEvent event = objectMapper.readValue(message, ReversalEvent.class);
+        
+        Transaction txn = transactionRepository
+            .findById(event.getTransactionId())
+            .orElseThrow();
+        
+        txn.setStatus(TransactionStatus.REVERSED);
+        transactionRepository.save(txn);
+        
+        logger.info("Transaction {} REVERSED", txn.getId());
+    }
+}
+```
+
+### Transaction Failure Consumer
+
+```java
+@Component
+public class TransactionFailureConsumer {
+    
+    @Autowired
+    private TransactionRepository transactionRepository;
+    
+    @Autowired
+    private OutboxEventRepository outboxRepository;
+    
+    // Handle credit failure
+    @KafkaListener(topics = "credit-failed-topic",
+                   groupId = "transaction-group")
+    public void handleCreditFailure(String message) {
+        CreditFailureEvent event = objectMapper
+            .readValue(message, CreditFailureEvent.class);
+        
+        Transaction txn = transactionRepository
+            .findById(event.getTransactionId())
+            .orElseThrow();
+        
+        txn.setStatus(TransactionStatus.FAILED);
+        transactionRepository.save(txn);
+        
+        // ⚠️ Important: Initiate reversal
+        // Don't publish directly, use outbox pattern
+        OutboxEvent reversal = new OutboxEvent(
+            txn.getId(),
+            EventType.REVERSAL,
+            createReversalPayload(txn),
+            OutboxStatus.PENDING
+        );
+        outboxRepository.save(reversal);
+        
+        logger.warn("Transaction {} FAILED, reversal initiated", txn.getId());
+    }
+    
+    // Handle debit failure
+    @KafkaListener(topics = "debit-failed-topic",
+                   groupId = "transaction-group")
+    public void handleDebitFailure(String message) {
+        DebitFailureEvent event = objectMapper
+            .readValue(message, DebitFailureEvent.class);
+        
+        Transaction txn = transactionRepository
+            .findById(event.getTransactionId())
+            .orElseThrow();
+        
+        txn.setStatus(TransactionStatus.FAILED);
+        transactionRepository.save(txn);
+        
+        // No reversal needed (debit never succeeded)
+        logger.warn("Transaction {} FAILED at debit", txn.getId());
+    }
+}
+```
+
+### Why Reversal Uses Outbox
+
+```
+❌ Direct publish:
+Transaction Service
+    ├─ Receive credit-failed event
+    ├─ Directly publish reversal to Kafka
+    ├─ Problem: Database tx and Kafka publish not atomic
+    ├─ If process crashes between update and publish
+    └─ Update lost, reversal lost
+
+✅ Outbox pattern:
+Transaction Service
+    ├─ Receive credit-failed event
+    ├─ BEGIN DB TRANSACTION
+    │  ├─ UPDATE transaction status = FAILED
+    │  ├─ INSERT INTO outbox (reversal event, status=PENDING)
+    │  └─ COMMIT
+    ├─ Separate OutboxPublisher
+    │  ├─ Polls database for PENDING events
+    │  ├─ Publishes to Kafka
+    │  └─ Updates database when confirmed
+    └─ If crash, outbox publisher retries
+
+Benefit:
+└─ Atomic database operation
+└─ Reversal guaranteed to be published
+└─ No dual-write problem
+```
+
+---
+
+## Kafka Retry & Dead Letter Queue
+
+### Retry Configuration
+
+```yaml
+spring:
+  kafka:
+    listener:
+      ack-mode: manual_immediate
+      error-handler: defaultErrorHandler
+
+defaultErrorHandler:
+  retry:
+    enabled: true
+    max-attempts: 3
+    backoff:
+      delay: 2000ms
+      multiplier: 2.0
+      max-delay: 16000ms
+```
+
+### Retry Flow
+
+```
+Message received
+    ↓
+Process attempt 1
+    ├─ Success → commit offset
+    └─ Failure → retry with backoff
+
+Wait 2 seconds
+    ↓
+Process attempt 2
+    ├─ Success → commit offset
+    └─ Failure → retry with backoff
+
+Wait 4 seconds (2 * 2)
+    ↓
+Process attempt 3
+    ├─ Success → commit offset
+    └─ Failure → send to DLT
+
+Dead Letter Topic
+    ├─ credit-success-topic.DLT
+    └─ Exception logged for investigation
+```
+
+### Dead Letter Queue Consumer
+
+```java
+@Component
+public class TransactionDLQConsumer {
+    
+    @Autowired
+    private DeadLetterEventRepository dlqRepository;
+    
+    // Listen to all DLT topics
+    @KafkaListener(topics = {
+        "credit-success-topic.DLT",
+        "credit-failed-topic.DLT",
+        "debit-failed-topic.DLT",
+        "reversal-success-topic.DLT"
+    }, groupId = "transaction-dlq-group")
+    public void handleDLTMessage(
+        @Payload(required = false) String message,
+        @Header(KafkaHeaders.RECEIVED_TOPIC) String topic,
+        @Header(KafkaHeaders.RECEIVED_PARTITION_ID) int partition,
+        @Header(KafkaHeaders.OFFSET) long offset,
+        @Header(name = KafkaHeaders.EXCEPTION_MESSAGE, required = false) String exception) {
+        
+        DeadLetterEvent dlEvent = new DeadLetterEvent();
+        dlEvent.setTopic(topic);
+        dlEvent.setPartition(partition);
+        dlEvent.setOffset(offset);
+        dlEvent.setPayload(message);
+        dlEvent.setExceptionMessage(exception);
+        
+        dlqRepository.save(dlEvent);
+        
+        logger.error("DLT Message: {} - {} - offset: {}",
+            topic, exception, offset);
+    }
+}
+```
+
+### Dead Letter Table
+
+```sql
+CREATE TABLE dead_letter_events (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  topic VARCHAR(100),
+  partition INT,
+  offset BIGINT,
+  payload TEXT,
+  error_message TEXT,
+  exception_class VARCHAR(255),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### Administrative Recovery
+
+```
+Workflow for failed events:
+
+1. Monitor DLT topic
+2. Inspect dead_letter_events table
+3. Identify root cause
+   ├─ Transient (network) → retry immediately
+   ├─ Business logic → fix and replay
+   └─ Data corruption → manual investigation
+
+4. Correct underlying issue
+
+5. Replay event
+   ├─ Read from dead_letter_events
+   ├─ Republish to original topic
+   ├─ Monitor reprocessing
+   └─ Remove from DLT when successful
+```
+
+---
+
+## OpenFeign Service Communication
+
+### Definition
+
+**OpenFeign** is a declarative REST client for service-to-service communication with automatic retries and timeout handling.
+
+### What You Implemented
+
+```java
+@FeignClient(name = "account-service")
+public interface AccountServiceClient {
+    
+    // Validate if transfer is possible
+    @GetMapping("/api/v1/accounts/validate-transfer")
+    ResponseEntity<Boolean> validateTransfer(
+        @RequestParam String accountNo,
+        @RequestParam BigDecimal amount,
+        @RequestHeader("Authorization") String jwt);
+    
+    // Internal endpoint to update balance
+    @PostMapping("/api/v1/accounts/internal/balance-update")
+    ResponseEntity<Void> updateBalance(
+        @RequestBody BalanceUpdateRequest request,
+        @RequestHeader("Authorization") String jwt);
+}
+```
+
+### Configuration
+
+```yaml
+spring:
+  cloud:
+    openfeign:
+      client:
+        config:
+          account-service:
+            connect-timeout: 3000  # 3 seconds
+            read-timeout: 5000     # 5 seconds
+```
+
+### Usage in Transaction Service
+
+```java
+@Service
+public class TransactionService {
+    
+    @Autowired
+    private AccountServiceClient accountClient;
+    
+    public TransactionResponse initiateTransfer(
+        TransferRequest request,
+        String jwt) {
+        
+        try {
+            // Validate with Account Service
+            ResponseEntity<Boolean> validation =
+                accountClient.validateTransfer(
+                    request.getFromAccount(),
+                    request.getAmount(),
+                    "Bearer " + jwt);
+            
+            if (!validation.getBody()) {
+                throw new InsufficientBalanceException(
+                    "Transfer validation failed");
+            }
+            
+            // Save transaction
+            Transaction txn = new Transaction(request);
+            transactionRepository.save(txn);
+            
+            // Create outbox event
+            OutboxEvent event = new OutboxEvent(
+                txn.getId(),
+                EventType.DEBIT,
+                createDebitPayload(txn),
+                OutboxStatus.PENDING);
+            outboxRepository.save(event);
+            
+            return new TransactionResponse(txn.getId(), "INITIATED");
+            
+        } catch (FeignException e) {
+            logger.error("Account Service call failed", e);
+            throw new ServiceUnavailableException("Account Service down");
+        }
+    }
+}
+```
+
+---
+
+## Authorization Propagation
+
+### Definition
+
+**Authorization Propagation** forwards the original client's JWT token through service-to-service calls to maintain security context.
+
+### Implementation
+
+```java
+@Component
+public class FeignAuthInterceptor implements RequestInterceptor {
+    
+    @Override
+    public void apply(RequestTemplate template) {
+        ServletRequestAttributes attributes =
+            (ServletRequestAttributes) RequestContextHolder
+                .getRequestAttributes();
+        
+        if (attributes != null) {
+            HttpServletRequest request =
+                attributes.getRequest();
+            
+            String authHeader = request
+                .getHeader("Authorization");
+            
+            if (authHeader != null && !authHeader.isEmpty()) {
+                template.header("Authorization", authHeader);
+            }
+        }
+    }
+}
+```
+
+### Flow
+
+```
+Client Request:
+Authorization: Bearer eyJhbGc...
+    ↓
+Transaction Service
+    ├─ Receives JWT
+    ├─ Validates JWT
+    ├─ Creates OpenFeign client
+    ├─ FeignAuthInterceptor extracts JWT
+    ├─ Adds to outgoing request
+    ↓
+Account Service
+    ├─ Receives: Authorization: Bearer eyJhbGc...
+    ├─ Validates JWT
+    ├─ Extracts user ID
+    └─ Processes in user context
+```
+
+### Security Benefits
+
+```
+✅ Transaction Service authenticated as user
+✅ Account Service knows transaction requester
+✅ Audit trail: who initiated transaction
+✅ Permission checking at each service
+✅ No privilege escalation
+```
+
+---
+
+## Business Limits & Validation
+
+### Daily Limits Configuration
+
+```yaml
+citicore:
+  transaction:
+    daily-limit:
+      TRANSFER: 500000      # 5 lakhs
+      DEPOSIT: 1000000      # 10 lakhs
+      WITHDRAWAL: 200000    # 2 lakhs
+```
+
+### Validation Flow
+
+```java
+@Service
+public class TransactionValidator {
+    
+    @Value("${citicore.transaction.daily-limit.TRANSFER:500000}")
+    private BigDecimal dailyTransferLimit;
+    
+    public void validateTransaction(
+        Transaction txn,
+        String accountNumber) {
+        
+        // Check daily limit
+        BigDecimal todayTotal = transactionRepository
+            .sumByAccountAndDateAndType(
+                accountNumber,
+                LocalDate.now(),
+                txn.getType());
+        
+        if (todayTotal.add(txn.getAmount())
+            .compareTo(dailyTransferLimit) > 0) {
+            
+            throw new DailyLimitExceededException(
+                "Daily limit exceeded for " + txn.getType());
+        }
+        
+        // Check account balance
+        ResponseEntity<Boolean> validation =
+            accountServiceClient.validateTransfer(
+                accountNumber,
+                txn.getAmount(),
+                jwt);
+        
+        if (!validation.getBody()) {
+            throw new InsufficientBalanceException(
+                "Insufficient balance");
+        }
+    }
+}
+```
+
+---
+
+## Application Load Balancer
+
+### Configuration
+
+```
+ALB: citicore-transaction-alb
+DNS: <transaction-alb-dns>.ap-south-1.elb.amazonaws.com
+
+Listener:
+├─ Protocol: HTTP
+├─ Port: 8084
+
+Target Group: citicore-transaction-tg
+├─ Target Type: IP
+├─ Protocol: HTTP
+├─ Port: 8084
+```
+
+### Health Check
+
+```
+Path: /actuator/health
+Interval: 30 seconds
+Timeout: 5 seconds
+Healthy Threshold: 2
+Unhealthy Threshold: 3
+
+Expected Response:
+{
+  "status": "UP"
+}
+```
+
+### Traffic Path
+
+```
+Internet Client
+    ↓
+HTTP :8084
+    ↓
+ALB
+    ↓
+Target Group (routes to Healthy targets)
+    ↓
+ECS Fargate Task :8084
+    ↓
+Spring Boot Application
+```
+
+---
+
+## Security Group Configuration
+
+### ALB Security Group
+
+```
+Inbound:
+├─ TCP 8084 from 0.0.0.0/0 (internet)
+
+Outbound:
+├─ All traffic to 0.0.0.0/0
+```
+
+### ECS Security Group
+
+```
+Inbound:
+├─ TCP 8084 from transaction-alb-sg
+│  └─ Allows ALB to reach ECS task
+├─ TCP 3306 from RDS security group is NOT needed here
+│  └─ ECS reaches RDS, RDS SG allows inbound
+
+Outbound:
+├─ All traffic to 0.0.0.0/0
+│  ├─ Allow to RDS (MySQL)
+│  ├─ Allow to EC2 (Kafka, Redis)
+│  ├─ Allow to Secrets Manager (VPC endpoint)
+│  └─ Allow to other services
+```
+
+### RDS Security Group
+
+```
+Inbound:
+├─ TCP 3306 from citicore-ecs-sg
+│  └─ Allows all ECS tasks to reach RDS
+```
+
+---
+
+## Real Issues & Solutions
+
+### Issue #1: Secrets Manager Timeout
+
+**Symptoms:**
+```
+ResourceInitializationError:
+unable to retrieve secret from asm
+context deadline exceeded
+```
+
+**Root Cause:**
+```
+ECS task can't reach Secrets Manager
+├─ No public IP
+├─ No NAT Gateway route
+├─ No VPC endpoint
+└─ Or execution role lacks permissions
+```
+
+**Solution:**
+```
+Option A: NAT Gateway
+├─ Create NAT Gateway in public subnet
+├─ Route table points to NAT
+└─ ECS can reach internet-based Secrets Manager
+
+Option B: VPC Endpoint
+├─ Create VPC endpoint for Secrets Manager
+├─ Stays within AWS network
+└─ Faster, more secure
+
+Option C: Check IAM
+├─ Verify execution role has secretsmanager:GetSecretValue
+├─ Verify secret ARN is correct
+└─ Verify resource-based policy allows role
+```
+
+### Issue #2: Unknown Database Error
+
+**Symptoms:**
+```
+java.sql.SQLSyntaxErrorException:
+Unknown database 'citicore_transactiondb'
+```
+
+**Root Cause:**
+```
+✓ Network: can reach RDS
+✓ Auth: username/password correct
+✗ Database: schema not created
+```
+
+**Solution:**
+```sql
+-- Connect to RDS
+mysql -h transaction-db.*.rds.amazonaws.com -u admin -p
+
+-- Check what databases exist
+SHOW DATABASES;
+
+-- Create transaction database
+CREATE DATABASE citicore_transactiondb;
+USE citicore_transactiondb;
+
+-- Hibernate will auto-create tables if ddl-auto: update
+```
+
+### Issue #3: Target Group Unhealthy
+
+**Symptoms:**
+```
+Target: Unhealthy
+Reason: Request timed out
+```
+
+**Root Cause:**
+```
+Check in order:
+├─ ECS task running? (check ECS console)
+├─ Application listening on 8084?
+│  └─ ECS Exec: curl localhost:8084/actuator/health
+├─ ALB SG allows from ECS SG?
+│  └─ YES (configured)
+├─ ECS SG allows ALB SG on 8084?
+│  └─ YES (configured)
+├─ Is health endpoint working?
+│  └─ ECS Exec: curl localhost:8084/actuator/health
+└─ Dependencies UP?
+   └─ Database, Kafka, etc.
+```
+
+**Solution:**
+```
+Debug inside-out:
+1. ECS Exec into container
+2. curl localhost:8084/actuator/health
+3. If fails → application issue
+4. If works → ALB/networking issue
+5. Check ALB SG inbound rules
+6. Check ECS SG inbound rules
+7. Check target registration
+```
+
+---
+
+## Troubleshooting Methodology
+
+### Step-by-Step When Transaction Service Fails
+
+```
+Step 1: Check Task Status
+├─ ECS console
+├─ Is task RUNNING?
+└─ Is task receiving sufficient CPU/memory?
+
+Step 2: Check Container Logs
+├─ CloudWatch: /ecs/citicore-transaction-service
+├─ Look for startup exceptions
+├─ Look for configuration errors
+└─ Look for Kafka/Database errors
+
+Step 3: ECS Exec into Container
+aws ecs execute-command \
+  --cluster citicore-cluster \
+  --task <TASK_ID> \
+  --container citicore-transaction-service \
+  --interactive \
+  --command '/bin/sh'
+
+Step 4: Test Application Locally
+└─ curl -i http://127.0.0.1:8084/actuator/health
+
+Step 5: Test Dependencies
+├─ Kafka: check bootstrap-servers
+├─ Database: check JDBC URL
+├─ Config Server: check fetch
+├─ Eureka: check registration
+└─ Secrets Manager: check retrieval
+
+Step 6: Test Target Group Health
+├─ AWS console
+├─ Is target registered?
+├─ Is target HEALTHY?
+└─ What's the health check response?
+
+Step 7: Test ALB External Path
+curl http://<alb-dns>:8084/actuator/health
+
+Step 8: Test Transaction API
+curl -X POST \
+  http://<alb-dns>:8084/api/v1/transactions/transfer \
+  -H "Authorization: Bearer <JWT>" \
+  -d '{...}'
+```
+
+---
+
+## End-to-End Transaction Saga
+
+### Complete Flow for Transfer
+
+```
+1. Client Initiates
+   POST /api/v1/transactions/transfer
+   ├─ Sender: ACC001
+   ├─ Receiver: ACC002
+   ├─ Amount: 5000
+   └─ JWT: Bearer token
+
+2. Transaction Service
+   ├─ Validate JWT
+   ├─ Call Account Service to validate
+   │  └─ Check sender balance
+   ├─ Check daily limits
+   ├─ Save transaction (status=PENDING)
+   ├─ Save to outbox (DEBIT event, PENDING)
+   ├─ COMMIT
+   └─ Return: {txnId: uuid, status: INITIATED}
+
+3. OutboxPublisher (every 5s)
+   ├─ Find PENDING events
+   ├─ Publish DEBIT to Kafka
+   ├─ Wait for Kafka acknowledgement
+   ├─ Mark outbox SENT
+   └─ COMMIT
+
+4. Account Service (consumer)
+   ├─ Receive DEBIT event
+   ├─ Debit sender account
+   ├─ Publish debit-success-topic
+   ├─ Receive CREDIT event (from outbox, 5s later)
+   ├─ Credit receiver account
+   └─ Publish credit-success-topic
+
+5. Success Path
+   ├─ Transaction Service receives debit-success
+   │  └─ Update txn status = DEBIT_SUCCESS
+   ├─ Transaction Service receives credit-success
+   │  └─ Update txn status = COMPLETED
+   └─ End: Transaction COMPLETED
+
+6. Failure Path (if credit fails)
+   ├─ Account Service publishes credit-failed-topic
+   ├─ Transaction Service receives credit-failed
+   │  ├─ Update txn status = FAILED
+   │  ├─ Save REVERSAL event to outbox
+   │  └─ COMMIT
+   ├─ OutboxPublisher publishes REVERSAL
+   ├─ Account Service processes REVERSAL
+   ├─ Account Service publishes reversal-success-topic
+   ├─ Transaction Service receives reversal-success
+   │  └─ Update txn status = REVERSED
+   └─ End: Transaction REVERSED (debit undone)
+```
+
+---
+
+## Deployment Validation
+
+### Checklist
+
+```
+Build & Package:
+ ☑ Java 17 installed
+ ☑ Maven build successful
+ ☑ JAR created (159 MB)
+ ☑ No compilation errors
+
+Docker & ECR:
+ ☑ Docker image built
+ ☑ Docker runs locally
+ ☑ Pushed to ECR
+ ☑ Image digest stored
+
+ECS & Fargate:
+ ☑ Task definition created
+ ☑ CPU/memory configured
+ ☑ IAM roles assigned
+ ☑ Secrets Manager permissions
+
+Network:
+ ☑ VPC configured
+ ☑ Subnet assigned
+ ☑ Security groups set
+ ☑ NAT Gateway / VPC endpoint for Secrets Manager
+
+Configuration:
+ ☑ TRANSACTION_DB_HOST set
+ ☑ DB_USERNAME set
+ ☑ DB_PASSWORD set
+ ☑ KAFKA_BOOTSTRAP_SERVERS set
+
+Database:
+ ☑ RDS reachable
+ ☑ citicore_transactiondb created
+ ☑ Tables created (Hibernate auto-ddl)
+ ☑ RDS SG allows ECS SG
+
+Kafka:
+ ☑ Topics created
+ ☑ Bootstrap servers reachable
+ ☑ Consumer group configured
+
+Deployment:
+ ☑ ECS service created
+ ☑ Desired count: 1
+ ☑ Task reaches RUNNING status
+ ☑ Spring Boot starts (95s)
+ ☑ Tomcat on port 8084
+
+Health:
+ ☑ Eureka registered (UP)
+ ☑ Kafka connected (UP)
+ ☑ Database connected (UP)
+ ☑ Actuator health: UP
+
+ALB:
+ ☑ ALB created
+ ☑ Target group created
+ ☑ Health check configured
+ ☑ Target becomes HEALTHY
+ ☑ ALB listener on 8084
+
+API Testing:
+ ☑ /actuator/health returns 200
+ ☑ Postman: test transfer endpoint
+ ☑ Kafka events published
+ ☑ Transaction status updated
+```
+
+### Current Status (Latest Update)
+
+```
+✅ APPLICATION RUNNING
+
+Transaction Service status:
+├─ Spring Boot: ✅ Started in 95.692 seconds
+├─ Tomcat: ✅ Port 8084
+├─ Eureka: ✅ Registered (UP)
+├─ Kafka: ✅ Connected, consumers assigned
+├─ Database: ✅ citicore_transactiondb
+├─ Config Server: ✅ Configuration loaded
+├─ Spring Cloud Bus: ✅ Connected
+├─ OpenFeign: ✅ Account Service client
+
+Consumers Running:
+├─ TransactionEventConsumer: ✅
+├─ TransactionFailureConsumer: ✅
+├─ CreditFailureConsumer: ✅
+├─ DebitFailureConsumer: ✅
+├─ ReversalConsumer: ✅
+└─ TransactionDLQConsumer: ⚠️ Topic warnings
+
+Kafka Assignments:
+├─ credit-success-topic: ✅
+├─ credit-failed-topic: ✅
+├─ debit-failed-topic: ✅
+├─ reversal-success-topic: ✅
+├─ credit-success-topic.DLT: ⚠️ UNKNOWN_TOPIC
+└─ reversal-success-topic.DLT: ⚠️ UNKNOWN_TOPIC
+
+Note: DLT topic warnings are NOT blocking
+└─ Some DLT topics not created yet
+└─ Application continues normally
+└─ Will be created when first failure occurs
+```
+
+---
+
+## Interview-Ready Explanations
+
+### "Tell me about the Transaction Service architecture"
+
+**Response:**
+
+"Transaction Service orchestrates bank transfers using the Saga pattern with Kafka-based event choreography.
+
+**Architecture:**
+
+```
+Client sends transfer request
+    ↓
+Transaction Service validates
+    ├─ Calls Account Service (OpenFeign)
+    ├─ Checks daily limits
+    ├─ Saves transaction
+    └─ Writes to outbox (same transaction)
+    ↓
+OutboxPublisher polls every 5 seconds
+    ├─ Finds PENDING events
+    ├─ Publishes to Kafka
+    ├─ Waits for acknowledgement
+    └─ Marks SENT when confirmed
+    ↓
+Account Service (consumer) processes
+    ├─ Debits sender account
+    ├─ Credits receiver account
+    ├─ Publishes result events
+    ↓
+Transaction Service (result consumer)
+    ├─ Updates transaction status
+    ├─ On success: COMPLETED
+    ├─ On failure: initiates reversal
+    └─ On reversal complete: REVERSED
+```
+
+**Key architectural patterns:**
+
+1. **Transactional Outbox:** Business transaction and outbox event are saved atomically. Separate publisher publishes events. No dual-write problem, 100% reliability.
+
+2. **Saga Pattern:** Coordinated multi-step transaction. If any step fails, compensating transactions (reversals) are triggered automatically.
+
+3. **Event Choreography:** Services communicate through events. No central orchestrator. Loose coupling, high resilience.
+
+4. **OpenFeign:** Service-to-service calls to Account Service with JWT propagation for authorization.
+
+**Real production issue I solved:**
+
+During development, the OutboxPublisher was marking events SENT immediately after calling Kafka send(), which returns asynchronously. If the process crashed, Kafka hadn't actually confirmed yet, but we'd already marked it SENT—permanent data loss. Fixed by blocking on future.get() to wait for Kafka acknowledgement before marking SENT."
+
+### "How do you handle transaction failures and reversals?"
+
+**Response:**
+
+"Three-level failure handling:
+
+**1. Transactional Validation (immediate):**
+- Check JWT validity
+- Check daily limits
+- Call Account Service to validate balance
+- If fails: reject and return error to client
+
+**2. Asynchronous Processing (Kafka):**
+- If debit fails: mark transaction FAILED (no reversal needed, no money was debited)
+- If credit fails after successful debit: automatically trigger reversal
+- Reversal goes through outbox pattern, published to Kafka, Account Service processes
+
+**3. Retry & Dead Letter Queue:**
+- All Kafka consumers have retry logic: 3 attempts with exponential backoff (2s, 4s, 8s)
+- If all retries fail: message sent to Dead Letter Topic (DLT)
+- DLQ consumer persists failed events to dead_letter_events table
+- Admin can inspect, identify root cause, and replay
+
+**Why this approach:**
+- Immediate validation catches most errors early
+- Async Kafka allows independent retry logic at each service
+- Reversals use outbox pattern (no dual-write)
+- DLQ provides audit trail and manual recovery path"
+
+---
+
+## Key Takeaways
+
+```
+✅ Saga Pattern for Distributed Transactions
+   ├─ Orchestrate multi-service flows
+   ├─ Handle failures with compensation
+   └─ Eventual consistency
+
+✅ Transactional Outbox Pattern
+   ├─ Reliable event publishing
+   ├─ No dual-write problems
+   └─ 100% banking-grade guarantee
+
+✅ Kafka Async Processing
+   ├─ Decouples services
+   ├─ Improves performance
+   └─ Enables retries
+
+✅ OpenFeign for Service Calls
+   ├─ Declarative REST clients
+   ├─ JWT propagation
+   └─ Automatic timeouts
+
+✅ Comprehensive Error Handling
+   ├─ Validation → Retry → DLQ
+   ├─ Audit trail
+   └─ Manual recovery
+```
+
+---
+# CitiCore API Gateway - AWS ECS Deployment Comprehensive Notes
+
+**Complete guide to deploying API Gateway on AWS ECS Fargate with Spring Cloud Gateway routing, resilience patterns, Service Connect integration, and production gateway architecture.**
+
+---
+
+## Table of Contents
+
+1. [API Gateway Architecture & Purpose](#api-gateway-architecture--purpose)
+2. [Why API Gateway Was Introduced](#why-api-gateway-was-introduced)
+3. [Gateway Responsibilities](#gateway-responsibilities)
+4. [Technology Stack](#technology-stack)
+5. [Gateway Configuration](#gateway-configuration)
+6. [Spring Cloud Gateway Routes](#spring-cloud-gateway-routes)
+7. [Rate Limiting](#rate-limiting)
+8. [Circuit Breaker Pattern](#circuit-breaker-pattern)
+9. [Retry Configuration](#retry-configuration)
+10. [Maven Build & Docker](#maven-build--docker)
+11. [Amazon ECR Deployment](#amazon-ecr-deployment)
+12. [ECS Task Definition](#ecs-task-definition)
+13. [ECS Service & Networking](#ecs-service--networking)
+14. [Application Load Balancer](#application-load-balancer)
+15. [Service Connect Integration](#service-connect-integration)
+16. [Gateway Health Monitoring](#gateway-health-monitoring)
+17. [Service Connectivity](#service-connectivity)
+18. [Real Issues & Solutions](#real-issues--solutions)
+19. [Troubleshooting Methodology](#troubleshooting-methodology)
+20. [Production Hardening](#production-hardening)
+21. [Interview-Ready Explanations](#interview-ready-explanations)
+
+---
+
+## API Gateway Architecture & Purpose
+
+### Definition
+
+**API Gateway** is the single entry point for external clients, routing requests to internal microservices while providing centralized concerns like rate limiting, circuit breaking, and request transformation.
+
+### What You Implemented
+
+```
+Before API Gateway:
+
+Client
+   |
+   +---- Auth Service :8081
+   +---- User Service :8082
+   +---- Account Service :8083
+   +---- Transaction Service :8084
+
+Problems:
+├─ Multiple public endpoints
+├─ Tight coupling between client and services
+├─ Larger attack surface
+├─ Duplicated rate limiting
+├─ Duplicated resilience logic
+└─ Difficult API versioning
+
+After API Gateway:
+
+Internet
+   |
+   v
+Gateway ALB :8080
+   |
+   v
+API Gateway (Spring Cloud)
+   |
+   +---- Auth Service (internal)
+   +---- User Service (internal)
+   +---- Account Service (internal)
+   +---- Transaction Service (internal)
+
+Benefits:
+├─ Single external endpoint
+├─ Loose coupling (client knows only gateway)
+├─ Reduced attack surface
+├─ Centralized rate limiting
+├─ Centralized resilience policies
+├─ Easy API versioning and migration
+└─ Single point for security policies
+```
+
+---
+
+## Why API Gateway Was Introduced
+
+### Before: Problems with Direct Service Access
+
+```
+Client directly calls each service:
+
+curl http://auth-service-alb:8081/api/v1/auth/login
+curl http://user-service-alb:8082/api/v1/users/profile
+curl http://account-service-alb:8083/api/v1/accounts/balance/ACC001
+
+Issues:
+├─ Client must know all service endpoints
+├─ If Auth moves: client code breaks
+├─ If User DNS changes: client must update
+├─ Client must implement retry logic (duplicated)
+├─ Client must implement rate limiting (duplicated)
+├─ Client must implement circuit breaking (duplicated)
+├─ DDoS attack targets each service separately
+└─ Security policies duplicated across services
+```
+
+### After: Gateway Pattern
+
+```
+Client calls only Gateway:
+
+curl http://citicore-gateway-alb:8080/auth/login
+curl http://citicore-gateway-alb:8080/users/profile
+curl http://citicore-gateway-alb:8080/accounts/balance/ACC001
+
+Benefits:
+├─ Client knows one endpoint
+├─ Services can move, client unaffected
+├─ Rate limiting: one place
+├─ Circuit breaking: one place
+├─ Retry logic: one place
+├─ DDoS protection: one place
+├─ Security policies: one place
+└─ API versioning: transparent to client
+```
+
+---
+
+## Gateway Responsibilities
+
+### What You Implemented
+
+```
+Core Responsibilities:
+
+1. Request Routing
+   ├─ Route /auth/** → Auth Service :8081
+   ├─ Route /users/** → User Service :8082
+   ├─ Route /accounts/** → Account Service :8083
+   └─ Route /transactions/** → Transaction Service :8084
+
+2. Path Rewriting
+   ├─ External: /auth/login
+   └─ Internal: /api/v1/auth/login
+
+3. Rate Limiting
+   ├─ 2 requests per second per IP
+   ├─ Burst capacity: 4 requests
+   └─ Backed by Redis
+
+4. Circuit Breaking
+   ├─ Threshold: 50% failure rate
+   ├─ Sliding window: 10 requests
+   ├─ Open state timeout: 10 seconds
+   └─ Fallback: /fallback/service
+
+5. Retry Logic
+   ├─ Retries: 1
+   ├─ On status: 503, 504, 500
+   ├─ On exception: TimeoutException
+   └─ Backoff: exponential (100ms → 500ms)
+
+6. Central Entry Point
+   ├─ Single ALB for all clients
+   ├─ Single DNS endpoint
+   └─ Single security policy
+
+7. Service-to-Service Routing
+   ├─ Service Connect DNS
+   ├─ Internal routing
+   └─ No external exposure
+
+8. Configuration Management
+   ├─ Routes from Config Server
+   ├─ Rate limit tuning via Git
+   ├─ Circuit breaker settings
+   └─ No code changes needed
+```
+
+---
+
+## Technology Stack
+
+### What You Implemented
+
+```
+Java 17
+├─ LTS version
+├─ Stable platform
+└─ Matches other services
+
+Spring Boot 3.2.4
+├─ Application framework
+├─ Fast startup
+└─ Low memory footprint
+
+Spring Cloud Gateway
+├─ Route definitions
+├─ Request filtering
+├─ Path rewriting
+└─ Built-in resilience
+
+Resilience4j
+├─ Circuit breaker
+├─ Rate limiting
+├─ Retry
+└─ Non-blocking
+
+Spring Cloud Config
+├─ Centralized configuration
+├─ GitHub-backed
+└─ Dynamic updates via Kafka
+
+Spring Cloud Eureka Client
+├─ Service discovery
+├─ Client-side load balancing (lb://)
+└─ Health checks
+
+Redis
+├─ Rate limiter state
+├─ Request tracking
+└─ Distributed rate limiting
+
+Docker
+├─ Container packaging
+├─ Java 17 JRE
+└─ Minimal image size
+
+AWS ECS/Fargate
+├─ Serverless container orchestration
+├─ Auto-scaling capable
+├─ VPC networking
+└─ CloudWatch integration
+```
+
+---
+
+## Gateway Configuration
+
+### Application Settings
+
+```yaml
+# application.yml (from Config Server)
+
+server:
+  port: 8080
+
+spring:
+  application:
+    name: apigateway-service
+
+  config:
+    import: optional:configserver:http://citicore-config-alb-1654378622.ap-south-1.elb.amazonaws.com
+
+  cloud:
+    gateway:
+      # Routes defined in apigateway-service.yml
+      routes: []  # Loaded from Config Server
+
+    config:
+      enabled: true
+```
+
+### Config Server Integration
+
+```
+Configuration Flow:
+
+GitHub Config Repository
+├─ application.yml (shared)
+├─ apigateway-service.yml (gateway-specific)
+├─ auth-service.yml
+├─ user-service.yml
+├─ account-service.yml
+└─ transaction-service.yml
+
+        ↓
+Config Server :8888
+        ↓
+API Gateway :8080
+
+Benefits:
+├─ Routes updated without redeployment
+├─ Rate limits tuned via Git
+├─ Circuit breaker settings changed dynamically
+└─ Config versioned and audited
+```
+
+---
+
+## Spring Cloud Gateway Routes
+
+### Definition
+
+**Routes** define how external paths map to internal services, including request transformation and resilience policies.
+
+### What You Implemented
+
+**Auth Service Route:**
+
+```yaml
+- id: auth-service
+  uri: http://auth-service-8081-tcp.citicore:8081
+  predicates:
+    - Path=/auth/**
+    - Method=GET,POST
+  filters:
+    - RewritePath=/auth/(?<segment>.*), /api/v1/auth/${segment}
+    - CircuitBreaker=auth,forward:/fallback/auth
+    - Retry=retries=1,statuses=503;504
+```
+
+**Route Processing:**
+
+```
+Client Request:
+POST http://gateway:8080/auth/login
+
+Step 1: Match predicate
+├─ Path=/auth/** ✓
+├─ Method=POST ✓
+└─ Route: auth-service selected
+
+Step 2: Apply filters
+├─ RewritePath: /auth/login → /api/v1/auth/login
+├─ CircuitBreaker: check if Auth service is healthy
+├─ Retry: if timeout/5xx, retry once
+└─ RateLimiter: check if client under rate limit
+
+Step 3: Forward request
+POST http://auth-service-8081-tcp.citicore:8081/api/v1/auth/login
+
+Step 4: Receive response
+HTTP 200 OK → return to client
+
+OR
+
+Step 4b: Timeout/Failure
+├─ Circuit breaker detects failure
+├─ Retry logic attempts once more
+├─ If still fails: CircuitBreaker open
+└─ Return: fallback response or 503
+```
+
+**User Service Route:**
+
+```yaml
+- id: user-service
+  uri: http://user-service-8082-tcp.citicore:8082
+  predicates:
+    - Path=/users/**
+  filters:
+    - RewritePath=/users/(?<segment>.*), /api/v1/users/${segment}
+    - CircuitBreaker=user,forward:/fallback/users
+    - Retry=retries=1,statuses=503;504
+```
+
+**Account Service Route:**
+
+```yaml
+- id: account-service
+  uri: http://citicore-account-service-8083-tcp.citicore:8083
+  predicates:
+    - Path=/accounts/**
+  filters:
+    - RewritePath=/accounts/(?<segment>.*), /api/v1/accounts/${segment}
+    - CircuitBreaker=account,forward:/fallback/accounts
+    - Retry=retries=1,statuses=503;504
+```
+
+**Why Service Connect DNS:**
+
+```
+Service Connect (citicore namespace):
+
+auth-service-8081-tcp.citicore:8081
+├─ Service name: auth-service
+├─ Port: 8081
+├─ Namespace: citicore
+└─ Hostname stable (task IPs change)
+
+Alternative (don't use):
+├─ 10.0.1.50:8081 (task IP, changes when replaced)
+├─ Problem: hardcoded IP breaks when task restarts
+└─ Solution: always use Service Connect DNS
+
+Key URLs:
+├─ Auth: auth-service-8081-tcp.citicore:8081
+├─ User: user-service-8082-tcp.citicore:8082
+├─ Account: citicore-account-service-8083-tcp.citicore:8083 (note prefix)
+└─ Eureka: eureka-server-8761-tcp.citicore:8761
+```
+
+---
+
+## Rate Limiting
+
+### Definition
+
+**Rate Limiting** restricts request frequency per client to prevent abuse and ensure fair resource usage.
+
+### What You Implemented
+
+**Configuration:**
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 2
+            redis-rate-limiter.burstCapacity: 4
+            redis-rate-limiter.requestedTokens: 1
+            key-resolver: "#{@ipKeyResolver}"
+```
+
+**How It Works (Token Bucket Algorithm):**
+
+```
+Initial state:
+├─ Tokens available: 4
+├─ Replenish rate: 2 tokens/second
+└─ Each request costs: 1 token
+
+Request 1: 4 tokens available → grant request, tokens = 3
+Request 2: 3 tokens available → grant request, tokens = 2
+Request 3: 2 tokens available → grant request, tokens = 1
+Request 4: 1 token available → grant request, tokens = 0
+Request 5: 0 tokens available → REJECT (429 Too Many Requests)
+Request 6: Wait 500ms, replenish 1 token, tokens = 1 → grant request
+
+State persisted in Redis:
+├─ Key: request-rate-limit:CLIENT_IP
+├─ Value: tokens_remaining, last_update_time
+└─ Shared across Gateway instances
+```
+
+**Key Resolver (IP-based):**
+
+```java
+@Configuration
+public class RateLimiterConfig {
+    
+    @Bean
+    public KeyResolver ipKeyResolver() {
+        return exchange -> 
+            Mono.just(exchange.getRequest()
+                .getHeaders()
+                .getFirst("X-Forwarded-For")
+                .split(",")[0]
+                .trim());
+    }
+}
+```
+
+**Result:**
+
+```
+Without rate limiting:
+├─ Single client sends 1000 req/sec
+├─ Monopolizes gateway resources
+└─ All other clients starved
+
+With rate limiting:
+├─ Per-client limit: 2 req/sec
+├─ Burst allowed: 4 requests
+├─ All clients get fair access
+└─ Prevents single-user DoS
+```
+
+---
+
+## Circuit Breaker Pattern
+
+### Definition
+
+**Circuit Breaker** stops forwarding requests to a failing service, returning fast-fail responses instead.
+
+### What You Implemented
+
+**Configuration:**
+
+```yaml
+resilience4j:
+  circuitbreaker:
+    instances:
+      auth:
+        slidingWindowSize: 10
+        failureRateThreshold: 50
+        slowCallRateThreshold: 50
+        slowCallDurationThreshold: 3s
+        waitDurationInOpenState: 10s
+        permittedNumberOfCallsInHalfOpenState: 2
+        
+      user:
+        # Same as auth
+        
+      account:
+        # Same as auth
+```
+
+**States:**
+
+```
+CLOSED (healthy):
+├─ Requests forwarded normally
+├─ Count failures in sliding window
+└─ If failure% > 50%, open circuit
+
+OPEN (failing):
+├─ Fast-fail: return 503 immediately
+├─ No requests forwarded
+├─ Wait 10 seconds
+└─ Then enter HALF_OPEN
+
+HALF_OPEN (testing recovery):
+├─ Allow 2 test requests
+├─ If both succeed: CLOSED
+├─ If either fails: OPEN
+└─ Back to 10-second wait
+```
+
+**Real Scenario:**
+
+```
+User Service is down:
+
+Request 1: Forward → 500 error
+Request 2: Forward → 500 error
+Request 3: Forward → 500 error
+Request 4: Forward → 500 error
+Request 5: Forward → 500 error  (5/10 failures = 50%)
+Request 6: Circuit OPEN → 503 immediately (fast-fail)
+Request 7: Circuit OPEN → 503 immediately
+...
+Request 30: Circuit HALF_OPEN → Try forward
+            User service recovered → 200 OK
+Request 31: Circuit CLOSED → Forward normally
+
+Benefit:
+├─ Don't hammer failing service
+├─ Don't timeout customer requests
+├─ Automatic recovery detection
+└─ Fast feedback to client
+```
+
+---
+
+## Retry Configuration
+
+### Definition
+
+**Retry** automatically re-sends requests on transient failures (timeout, 5xx).
+
+### What You Implemented
+
+**Configuration:**
+
+```yaml
+resilience4j:
+  retry:
+    instances:
+      user:
+        maxAttempts: 2  # 1 retry = 2 attempts
+        waitDuration: 100ms
+        retryExceptions:
+          - java.util.concurrent.TimeoutException
+          - java.net.SocketTimeoutException
+        ignoreExceptions:
+          - java.lang.IllegalArgumentException
+```
+
+**Route Configuration:**
+
+```yaml
+- id: user-service
+  filters:
+    - name: Retry
+      args:
+        retries: 1
+        methods: GET
+        statuses: 
+          - BAD_GATEWAY
+          - GATEWAY_TIMEOUT
+          - INTERNAL_SERVER_ERROR
+        backoff:
+          firstBackoff: 100ms
+          maxBackoff: 500ms
+          factor: 2
+```
+
+**Retry Flow:**
+
+```
+Request → Timeout (5 seconds)
+
+Attempt 1:
+├─ User Service very slow
+└─ Gateway timeout after 3 seconds
+
+Attempt 2 (after 100ms backoff):
+├─ User Service recovered from temporary overload
+└─ Returns 200 OK
+
+Result:
+├─ Client sees: 200 OK
+├─ Transparent retry happened
+├─ Request succeeded without client intervention
+└─ Improves resilience dramatically
+```
+
+---
+
+## Maven Build & Docker
+
+### Build Process
+
+```bash
+# Step 1: Clean and compile
+mvn clean compile
+
+# Step 2: Package to JAR
+mvn package
+
+# Result:
+# apigateway-service-0.0.1-SNAPSHOT.jar (~150 MB)
+```
+
+### Dockerfile
+
+```dockerfile
+FROM eclipse-temurin:17-jre
+
+WORKDIR /app
+
+COPY target/apigateway-service-0.0.1-SNAPSHOT.jar app.jar
+
+EXPOSE 8080
+
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+### Docker Build & Test
+
+```bash
+# Build image
+docker build -t citicore/apigateway-service:1.0 .
+
+# Test locally
+docker run -d -p 8080:8080 \
+  -e SPRING_CONFIG_IMPORT=optional:configserver:http://config-server:8888 \
+  citicore/apigateway-service:1.0
+
+# Verify
+curl http://localhost:8080/actuator/health
+```
+
+---
+
+## Amazon ECR Deployment
+
+### Repository Setup
+
+```
+Repository: citicore/apigateway-service
+URI: 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/apigateway-service
+Image: :1.0
+```
+
+### Push Process
+
+```bash
+# Step 1: Authenticate
+aws ecr get-login-password --region ap-south-1 | \
+  docker login --username AWS --password-stdin \
+  580655778303.dkr.ecr.ap-south-1.amazonaws.com
+
+# Step 2: Tag for ECR
+docker tag citicore/apigateway-service:1.0 \
+  580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/apigateway-service:1.0
+
+# Step 3: Push to ECR
+docker push 580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/apigateway-service:1.0
+
+# Step 4: Verify in ECR console
+aws ecr list-images --repository-name citicore/apigateway-service
+```
+
+---
+
+## ECS Task Definition
+
+### Configuration
+
+```yaml
+Task: citicore-apigateway-service
+
+Compute:
+  Launch Type: FARGATE
+  OS: Linux
+  Architecture: X86_64
+  CPU: 0.5 vCPU
+  Memory: 1 GiB
+  Network Mode: awsvpc
+
+Container:
+  Name: citicore-apigateway-service
+  Image: ECR:1.0
+  Port Mapping: 8080:8080/TCP
+
+IAM Roles:
+  Task Role: citicore-ecs-task-role
+  Execution Role: citicore-ecs-task-execution-role
+
+Features:
+  ECS Exec: Enabled
+  Logging: CloudWatch /ecs/citicore-apigateway-service
+```
+
+### Why These Resources
+
+```
+CPU: 0.5 vCPU
+├─ Gateway mostly network I/O
+├─ Request forwarding: lightweight
+├─ Rate limiter: light computation
+├─ Single instance sufficient
+└─ 0.5 vCPU adequate
+
+Memory: 1 GB
+├─ Spring Boot base: ~200 MB
+├─ Spring Cloud libraries: ~300 MB
+├─ Resilience4j: ~50 MB
+├─ Route definitions: ~50 MB
+├─ Safety margin: ~400 MB
+└─ Total: ~1000 MB
+```
+
+---
+
+## ECS Service & Networking
+
+### Service Configuration
+
+```
+Service: citicore-apigateway-service
+Desired count: 1
+Deployment type: Rolling update
+
+Deployment configuration:
+├─ Minimum healthy percent: 100%
+├─ Maximum percent: 200%
+└─ Circuit breaker: Enabled (auto-rollback on failure)
+
+Networking:
+├─ awsvpc mode
+├─ Each task gets ENI
+├─ Each task gets private IP
+└─ Example: 10.0.1.x (changes on restart)
+```
+
+### Critical: Task IPs Are Ephemeral
+
+```
+❌ NEVER hardcode task IP:
+   "gateway-route: http://10.0.1.100:8080"
+   Problem: Task restarts → New IP 10.0.2.150 → Route broken
+
+✅ ALWAYS use Service Connect DNS:
+   "gateway-route: http://apigateway-service-8080-tcp.citicore:8080"
+   Benefit: Task IP changes, DNS stays same, routing works
+```
+
+---
+
+## Application Load Balancer
+
+### Configuration
+
+```
+ALB: citicore-gateway-alb
+DNS: citicore-gateway-alb-980017400.ap-south-1.elb.amazonaws.com
+
+Listener:
+├─ Protocol: HTTP
+├─ Port: 8080
+└─ Target: citicore-gateway-tg
+
+Traffic Path:
+Internet
+   ↓ HTTP :8080
+Gateway ALB
+   ↓ HTTP :8080
+Target Group (IP type)
+   ↓ 10.0.x.x:8080
+Gateway ECS Task
+```
+
+### Target Group Configuration
+
+```
+Name: citicore-gateway-tg
+Type: IP (not EC2)
+Protocol: HTTP
+Port: 8080
+
+Health Check:
+├─ Path: /actuator/health
+├─ Protocol: HTTP
+├─ Interval: 30s
+├─ Timeout: 5s
+├─ Healthy threshold: 2
+├─ Unhealthy threshold: 3
+
+Targets registered automatically by ECS.
+```
+
+---
+
+## Service Connect Integration
+
+### What It Provides
+
+```
+Service Connect Namespace: citicore
+
+Known Service Aliases:
+├─ eureka-server-8761-tcp.citicore:8761
+├─ auth-service-8081-tcp.citicore:8081
+├─ user-service-8082-tcp.citicore:8082
+├─ citicore-account-service-8083-tcp.citicore:8083
+└─ (transaction-service TBD)
+
+How it works:
+Gateway
+   ↓
+Resolves: user-service-8082-tcp.citicore
+   ↓
+Service Connect DNS (127.255.0.8)
+   ↓
+Service Connect proxy
+   ↓
+Actual User Service task
+```
+
+---
+
+## Gateway Health Monitoring
+
+### Actuator Endpoint
+
+```bash
+GET http://gateway-alb:8080/actuator/health
+
+Response:
+{
+  "status": "UP",
+  "components": {
+    "clientConfigServer": {"status": "UP"},
+    "discoveryComposite": {"status": "UP"},
+    "diskSpace": {"status": "UP"},
+    "ping": {"status": "UP"},
+    "refreshScope": {"status": "UP"}
+  }
+}
+```
+
+### Eureka Discovery
+
+```
+Gateway sees:
+├─ ACCOUNT-SERVICE: 1 instance
+├─ AUTH-SERVICE: 1 instance
+├─ APIGATEWAY-SERVICE: 1 instance (self)
+└─ USER-SERVICE: 1 instance
+```
+
+---
+
+## Service Connectivity
+
+### You Verified
+
+**Auth Service:**
+```bash
+curl http://auth-service-8081-tcp.citicore:8081/actuator/health
+→ 200 OK (working)
+```
+
+**User Service (Initial failure):**
+```bash
+curl http://user-service-8082-tcp.citicore:8082/actuator/health
+→ DNS resolved ✓
+→ Connected to 127.255.0.8 (Service Connect proxy) ✓
+→ Timeout ✗ (missing security group rule)
+```
+
+**Account Service:**
+```bash
+curl http://citicore-account-service-8083-tcp.citicore:8083/actuator/health
+→ DNS resolved ✓
+→ Connected to 127.255.0.8 ✓
+→ Timeout ✗ (missing security group rule)
+```
+
+---
+
+## Real Issues & Solutions
+
+### Issue #1: ECS Deployment Failures
+
+**Symptoms:**
+
+```
+ECS Events:
+├─ port 8080 is unhealthy
+├─ Request timed out
+├─ Health checks failed with codes: [503]
+└─ Task stopped, replacement started, health check failed, stopped...
+```
+
+**Root Cause:**
+
+```
+Multiple independent issues across layers:
+├─ Layer 1: Application startup slowness
+├─ Layer 2: ALB health check timeout
+├─ Layer 3: Service Connect DNS issues
+├─ Layer 4: Security group rules
+└─ Layer 5: Downstream service connectivity
+
+Result:
+└─ Any single issue → deployment failure
+└─ Multiple failures → circuit breaker rollback
+```
+
+**Solution:**
+
+```
+Debug incrementally:
+1. Verify ECS task running
+2. Verify target group healthy
+3. Test ALB external path
+4. ECS Exec into container
+5. Test DNS resolution
+6. Test HTTP connectivity
+7. Check security groups
+8. Review application logs
+```
+
+### Issue #2: DNS Resolves but Connectivity Fails
+
+**Symptoms:**
+
+```
+Gateway → User Service:
+
+DNS check:
+getent hosts user-service-8082-tcp.citicore
+→ 127.255.0.8  user-service-8082-tcp.citicore ✓ (works)
+
+HTTP test:
+curl http://user-service-8082-tcp.citicore:8082/actuator/health
+→ Operation timed out ✗ (fails)
+```
+
+**Root Cause:**
+
+```
+DNS ≠ Connectivity
+
+Layers:
+├─ DNS resolution: ✓ (127.255.0.8)
+├─ Service Connect proxy routing: ✓ (can reach proxy)
+├─ Security group rules: ✗ (blocking traffic)
+├─ Destination port: blocked
+└─ User Service: unreachable
+```
+
+**Solution:**
+
+```
+Add ECS SG self-referencing rule:
+
+For User Service (port 8082):
+├─ Type: Custom TCP
+├─ Protocol: TCP
+├─ Port: 8082
+├─ Source: sg-0b8ac20679059c792 (same ECS SG)
+└─ Allows: Gateway → User
+
+For Account Service (port 8083):
+├─ Type: Custom TCP
+├─ Protocol: TCP
+├─ Port: 8083
+├─ Source: sg-0b8ac20679059c792
+└─ Allows: Gateway → Account
+
+Result:
+Gateway ECS Task (same SG)
+   ↓ TCP 8082 allowed by rule
+User ECS Task (same SG)
+
+Now connectivity works!
+```
+
+### Issue #3: Redis Decision (Not Root Cause)
+
+**Investigation:**
+
+```
+Was it Redis causing connectivity timeouts?
+
+Evidence for Redis:
+├─ Some services showed Redis DOWN
+└─ Rate limiter uses Redis
+
+Evidence against Redis:
+├─ DNS resolution worked
+├─ Service Connect proxy responded
+├─ Only security group blocked traffic
+└─ Add SG rule → problem fixed (no Redis change)
+
+Conclusion:
+└─ DNS + HTTP timeout = security group, not Redis
+```
+
+---
+
+## Troubleshooting Methodology
+
+### Step-by-Step When Gateway Fails
+
+```
+Step 1: ECS Status
+├─ Is service ACTIVE?
+├─ Is task RUNNING?
+└─ Is container RUNNING?
+
+Step 2: Target Health
+├─ Is target registered?
+└─ Is target HEALTHY?
+
+Step 3: External ALB
+curl http://gateway-alb:8080/actuator/health
+├─ Does ALB respond?
+└─ Is gateway application UP?
+
+Step 4: ECS Exec
+aws ecs execute-command ... /bin/sh
+├─ Enter the container
+└─ Test from inside
+
+Step 5: DNS Resolution
+getent hosts user-service-8082-tcp.citicore
+├─ Does Service Connect DNS resolve?
+└─ What IP is returned?
+
+Step 6: HTTP Connectivity
+curl http://user-service-8082-tcp.citicore:8082/actuator/health
+├─ Can reach destination?
+├─ Does it timeout?
+└─ Connection refused or timeout?
+
+Step 7: Security Groups
+Verify chain:
+├─ Gateway SG (citicore-ecs-sg)
+├─ Inbound TCP 8082 from same SG?
+├─ Destination port open?
+└─ Destination SG allows source?
+
+Step 8: Application Logs
+CloudWatch Logs: /ecs/citicore-apigateway-service
+├─ TimeoutException?
+├─ UnknownHostException?
+├─ Connection refused?
+└─ CircuitBreaker triggered?
+
+Step 9: Downstream Services
+Only after network is verified:
+├─ Check RDS
+├─ Check Kafka
+├─ Check Redis
+├─ Check Eureka
+└─ Check Config Server
+```
+
+---
+
+## Production Hardening
+
+### Current vs Production
+
+```
+Current (Development):
+├─ HTTP :8080
+├─ Public subnets
+├─ Single task
+├─ No monitoring
+└─ No secrets management
+
+Production Target:
+├─ HTTPS :443 (ACM certificate)
+├─ Private subnets (NAT Gateway)
+├─ Multiple tasks (auto-scaling)
+├─ Comprehensive monitoring
+└─ AWS Secrets Manager
+```
+
+### HTTPS Setup
+
+```
+Current:
+└─ http://citicore-gateway-alb:8080
+
+Production:
+├─ ALB listener: HTTPS :443
+├─ Certificate: AWS Certificate Manager (ACM)
+├─ Certificate renewal: automatic
+├─ Redirect: HTTP :80 → HTTPS :443
+└─ Client: https://citicore-api.banking.example.com
+```
+
+### Private Subnets
+
+```
+Current:
+├─ ECS tasks in public subnets
+├─ Tasks have public IPs
+└─ Direct internet access possible
+
+Production:
+├─ ECS tasks in private subnets
+├─ No public IPs
+├─ NAT Gateway for outbound
+├─ Only ALB has public IP
+└─ Ingress only through ALB
+```
+
+### Auto Scaling
+
+```
+Current:
+├─ Desired tasks: 1
+└─ Manual scaling only
+
+Production:
+├─ Desired tasks: 3 (across AZs)
+├─ Min: 3, Max: 10
+├─ Scale on: CPU > 70%, Memory > 80%
+├─ Termination policy: oldest first
+└─ Rolling deployments with health checks
+```
+
+### Monitoring
+
+```
+Recommended:
+
+CloudWatch Logs:
+├─ /ecs/citicore-apigateway-service
+├─ ERROR, WARN levels
+└─ Searchable by request ID
+
+CloudWatch Metrics:
+├─ CPU utilization
+├─ Memory utilization
+├─ Network in/out
+└─ ECS task count
+
+ALB Metrics:
+├─ Request count
+├─ Latency (p50, p95, p99)
+├─ 4xx errors
+├─ 5xx errors
+└─ Target health
+
+Spring Actuator:
+├─ /actuator/metrics (prometheus format)
+├─ Circuit breaker state
+├─ Rate limiter status
+└─ Downstream health
+
+Alerts:
+├─ Task health CHECK_FAILED
+├─ 5xx error rate > 5%
+├─ Latency p99 > 5 seconds
+├─ Circuit breaker OPEN state
+└─ Memory utilization > 85%
+```
+
+---
+
+## Interview-Ready Explanations
+
+### "Tell me about the API Gateway architecture"
+
+**Response:**
+
+"The API Gateway is the single external entry point for all CitiCore microservices, providing centralized routing, resilience, and rate limiting.
+
+**Architecture:**
+
+```
+Client (external)
+    ↓
+Gateway ALB (HTTP :8080)
+    ↓
+Spring Cloud Gateway (resilience patterns)
+    ↓
+Internal services:
+├─ Auth Service :8081
+├─ User Service :8082
+├─ Account Service :8083
+└─ Transaction Service :8084
+```
+
+**Key responsibilities:**
+
+1. **Request Routing**: External paths map to internal services via Spring Cloud Gateway routes.
+
+2. **Path Rewriting**: /auth/login → /api/v1/auth/login (abstracts internal API structure).
+
+3. **Rate Limiting**: Redis-backed token bucket algorithm limits 2 req/sec per IP with 4-burst capacity.
+
+4. **Circuit Breaker**: Resilience4j detects service failures (50% failure threshold) and fast-fails (503) instead of timing out.
+
+5. **Retry Logic**: Automatic retries on timeouts, 503s, 504s with exponential backoff (100ms → 500ms).
+
+6. **Service Discovery**: Uses Service Connect DNS to route to internal services without hardcoding task IPs.
+
+**Real production issue I solved:**
+
+The gateway could resolve Service Connect DNS names but couldn't reach User/Account services—connections timed out. Testing revealed DNS worked (resolved to 127.255.0.8 proxy) but TCP connections failed. The issue was missing ECS security group rules. Gateway and downstream services shared the same SG, but inbound rules didn't allow gateway→user (8082) and gateway→account (8083). Adding self-referencing rules (source = same SG) fixed connectivity immediately.
+
+**Key pattern:** Don't hardcode task IPs—always use Service Connect DNS. Task IPs change when restarted; DNS remains stable."
+
+### "How do you handle request resilience in the gateway?"
+
+**Response:**
+
+"Three complementary patterns work together:
+
+**1. Rate Limiting (prevent abuse):**
+- Token bucket algorithm backed by Redis
+- 2 tokens/second, 4-burst capacity
+- Per-client (IP-based)
+- Returns 429 immediately if over limit
+- Protects downstream services from overload
+
+**2. Retry (handle transient failures):**
+- Automatic retry on timeout/5xx
+- 1 retry (2 attempts total)
+- Exponential backoff: 100ms → 500ms
+- Example: First attempt times out, second succeeds
+- Transparent to client
+
+**3. Circuit Breaker (stop cascading failures):**
+- Monitors success/failure ratio (50% threshold)
+- States: CLOSED (normal) → OPEN (failing) → HALF_OPEN (testing)
+- OPEN state: return 503 immediately (fast-fail)
+- Don't hammer failing service
+- Auto-recovery detection
+
+**Together they create resilience:**
+
+Scenario: User Service overloaded, 80% requests failing
+
+Without patterns:
+└─ All requests timeout, cascade failure
+
+With patterns:
+├─ Rate limiter: prevents additional load
+├─ Retries: transparent recovery on transient failures
+└─ Circuit breaker: fast-fail when sustained failure detected, allows recovery
+
+**Production benefit:**
+- Client sees fast, predictable responses
+- Failing service not hammered
+- Service has time to recover
+- Automatic recovery detection
+- No manual intervention needed"
+
+---
+
+## Key Takeaways
+
+```
+✅ Single External Entry Point
+   One ALB, one DNS, one gateway
+
+✅ Transparent Service Routing
+   Client doesn't know internal service locations
+
+✅ Centralized Resilience
+   Rate limiting, circuit breaking, retries in one place
+
+✅ Service Connect Stability
+   DNS names stable even as task IPs change
+
+✅ Critical Debugging Pattern
+   DNS ≠ Connectivity, test each layer separately
+
+✅ Security Group Lessons
+   ECS-to-ECS traffic requires explicit rules
+
+✅ Production Readiness
+   HTTPS, private subnets, monitoring, secrets management
+```
+
+---
