@@ -8036,3 +8036,1677 @@ The deployment order was intentional: infrastructure first, then Config Server, 
 I encountered issues like a 504 timeout caused by a missing Kafka topic, and UnknownHostException because Service Connect wasn't enabled on Eureka. Troubleshooting involved checking each layer: ECS task status, ALB target health, application logs, and external dependencies."
 
 ---
+# CitiCore Account Service - AWS ECS Deployment Comprehensive Notes
+
+**Complete guide to deploying Account Service microservice on AWS ECS Fargate with RDS TLS security, read/write routing, Kafka integration, Redis caching, and production banking APIs.**
+
+---
+
+## Table of Contents
+
+1. [Account Service Architecture](#account-service-architecture)
+2. [Starting AWS Infrastructure](#starting-aws-infrastructure)
+3. [Core Service Configuration](#core-service-configuration)
+4. [RDS TLS Security & Hardening](#rds-tls-security--hardening)
+5. [Java Truststore Configuration](#java-truststore-configuration)
+6. [Primary/Replica Datasources](#primaryreplica-datasources)
+7. [Production Database Setup](#production-database-setup)
+8. [Redis Integration](#redis-integration)
+9. [Kafka Integration](#kafka-integration)
+10. [Config Server Integration](#config-server-integration)
+11. [Eureka Service Discovery](#eureka-service-discovery)
+12. [Docker Build & ECR](#docker-build--ecr)
+13. [ECS Task Definition](#ecs-task-definition)
+14. [ECS Networking & Subnets](#ecs-networking--subnets)
+15. [Application Load Balancer](#application-load-balancer)
+16. [Security Group Configuration](#security-group-configuration)
+17. [ALB & ECS Connectivity Troubleshooting](#alb--ecs-connectivity-troubleshooting)
+18. [Health Monitoring](#health-monitoring)
+19. [Account Service APIs](#account-service-apis)
+20. [Banking Operations](#banking-operations)
+21. [Testing & Verification](#testing--verification)
+22. [Real Issues & Solutions](#real-issues--solutions)
+23. [Troubleshooting Methodology](#troubleshooting-methodology)
+24. [Interview-Ready Explanations](#interview-ready-explanations)
+
+---
+
+## Account Service Architecture
+
+### Definition
+
+**Account Service** manages customer bank accounts, balances, statements, and financial transactions. It's the core service for account creation, deposits, withdrawals, and balance inquiries.
+
+### What You Implemented
+
+```
+Account Service Architecture:
+
+                    Internet
+                       |
+                       ↓
+        citicore-account-alb:8083
+                       |
+                       ↓
+        citicore-account-tg
+                       |
+                       ↓
+    ECS Account Service :8083
+                       |
+        +--------------+----------+----------+
+        |              |          |          |
+        ↓              ↓          ↓          ↓
+   RDS Primary   RDS Replica   Redis      Kafka
+   (Read-Write)  (Read-Only)   (Cache)   (Events)
+        |
+        +---- Config Server (centralized config)
+        +---- Eureka (service discovery)
+```
+
+### Key Responsibilities
+
+```
+Account Management:
+├─ Create accounts (SAVINGS, CURRENT, etc.)
+├─ Store account metadata
+├─ Track balances
+├─ Manage account status
+└─ Query accounts
+
+Financial Operations:
+├─ Deposits (credit account)
+├─ Withdrawals (debit account with lock)
+├─ Balance inquiries
+├─ Statement generation
+└─ Transaction history
+
+Integration Points:
+├─ RDS: Store account data (primary + replica)
+├─ Redis: Cache account balances
+├─ Kafka: Publish transaction events
+├─ Eureka: Register for discovery
+├─ Config Server: Get configuration
+└─ ALB: Expose APIs
+```
+
+---
+
+## Starting AWS Infrastructure
+
+### What Existed Before Account Service
+
+```
+citicore-vpc (vpc-0d064f45265cbcdad)
+├─ Public subnets (10.0.1.0/24, 10.0.2.0/24)
+├─ Private subnets (10.0.11.0/24, 10.0.12.0/24)
+├─ DB subnets (10.0.21.0/24, 10.0.22.0/24)
+└─ Security groups
+
+AWS Services:
+├─ RDS MySQL Primary + Replica (TLS configured)
+├─ EC2 for infrastructure (Kafka, Redis on Docker)
+├─ Amazon ECR (container registry)
+├─ Amazon ECS Cluster (Fargate)
+├─ IAM roles (task execution, task role)
+└─ Config Server deployment
+└─ Eureka Server deployment
+```
+
+### Deployment Order
+
+```
+AWS Infrastructure (already done)
+        ↓
+Config Server (already done)
+        ↓
+Eureka Server (already done)
+        ↓
+Account Service (this deployment)
+        ↓
+Next: User Service, Transaction Service, etc.
+```
+
+---
+
+## Core Service Configuration
+
+### Definition
+
+**Service Configuration** defines where Account Service runs, what port it listens on, and how it connects to dependencies.
+
+### What You Implemented
+
+**Account Service Details:**
+
+```yaml
+Application: account-service
+Runtime: Java 17
+Framework: Spring Boot 3.2.4
+Spring Cloud: 2023.0.3
+Port: 8083
+
+Server Configuration:
+  server:
+    port: 8083
+    address: 0.0.0.0
+    servlet:
+      multipart:
+        enabled: true
+        max-file-size: 10MB
+```
+
+### Why `address: 0.0.0.0`
+
+```
+address: 0.0.0.0 means:
+├─ Listen on all network interfaces
+├─ Accept connections from any IP
+├─ Critical in containers because:
+│  ├─ localhost (127.0.0.1) = container itself
+│  ├─ ECS task has private IP from ENI
+│  ├─ ALB forwards to private IP
+│  └─ Must listen on 0.0.0.0 to catch both
+
+address: localhost (127.0.0.1) means:
+├─ Only listen on container's loopback
+├─ ALB forwarding to task IP would fail
+├─ Application appears unreachable
+└─ Security group rules don't help if service not listening
+```
+
+---
+
+## RDS TLS Security & Hardening
+
+### Definition
+
+**TLS (Transport Layer Security)** encrypts database connections, preventing man-in-the-middle attacks. **Certificate Validation** ensures you're connecting to legitimate AWS RDS servers.
+
+### What You Implemented
+
+**Configuration Evolution:**
+
+```
+Development (Insecure):
+├─ useSSL=false
+├─ No encryption
+├─ No validation
+└─ Acceptable for local dev only
+
+Hardened (Secure):
+├─ sslMode=VERIFY_IDENTITY
+├─ TLS encryption
+├─ CA certificate validation
+├─ Hostname verification
+└─ Production-ready
+```
+
+### RDS Endpoints
+
+```
+Primary: citicore-mysql-primary.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com
+Replica: citicore-mysql-replica.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com
+Database: citicore_account
+Protocol: TLS 1.3
+Cipher: TLS_AES_256_GCM_SHA384
+```
+
+### TLS Verification Options
+
+```
+sslMode=DISABLE
+├─ No encryption
+└─ Insecure (dev only)
+
+sslMode=VERIFY_CA
+├─ Verify CA certificate
+├─ Encrypted connection
+├─ Does NOT verify hostname
+└─ Medium security
+
+sslMode=VERIFY_IDENTITY (Used)
+├─ Verify CA certificate
+├─ Verify hostname matches
+├─ Encrypted connection TLS 1.3
+└─ Full security (production)
+```
+
+### Testing RDS TLS Independently
+
+**Before troubleshooting Spring Boot, test RDS directly:**
+
+```bash
+# Connect to RDS with certificate verification
+mysql -h citicore-mysql-primary.cnk8ckkm2hsk.ap-south-1.rds.amazonaws.com \
+  -u citicore \
+  -p \
+  --ssl-mode=VERIFY_IDENTITY \
+  --ssl-ca=/path/to/rds-ca.pem
+
+# Expected output:
+# mysql> select VERSION();
+# Output: 8.0.35
+```
+
+**Why test independently:**
+```
+If RDS works with MySQL CLI:
+├─ RDS server is healthy
+├─ CA certificate is valid
+├─ Network connectivity works
+└─ Problem must be in Spring Boot configuration
+
+If RDS fails with MySQL CLI:
+├─ RDS not reachable
+├─ Certificate not trusted
+└─ Network issue (security group, routing)
+```
+
+---
+
+## Java Truststore Configuration
+
+### Definition
+
+**Truststore** is a Java keystore containing trusted Certificate Authorities. Java uses it to verify server certificates during TLS handshakes.
+
+### What You Encountered
+
+**Error:**
+
+```
+SSLHandshakeException: certificate_unknown
+CertPathValidatorException: Path does not chain with any of the trust anchors
+```
+
+**Cause:**
+
+```
+Java's default truststore (cacerts) includes common CAs.
+AWS RDS uses custom CA (aws-rds-ca).
+Java didn't trust AWS RDS CA by default.
+Connection failed during TLS handshake.
+```
+
+### Solution: Create Custom Truststore
+
+**Create truststore with AWS RDS CA:**
+
+```bash
+# 1. Download AWS RDS CA certificate
+# Available at: https://truststore.pki.rds.amazonaws.com/
+
+# 2. Create truststore with CA
+keytool -import \
+  -alias aws-rds-ca \
+  -file rds-ca.pem \
+  -keystore rds-truststore.jks \
+  -storepass <TRUSTSTORE_PASSWORD> \
+  -noprompt
+
+# 3. Verify certificate in truststore
+keytool -list \
+  -keystore rds-truststore.jks \
+  -storepass <TRUSTSTORE_PASSWORD>
+
+# Output:
+# aws-rds-ca, Jan 1, 2025, trustedCertEntry, ...
+```
+
+**Place in Docker image:**
+
+```dockerfile
+FROM eclipse-temurin:17-jre
+
+WORKDIR /app
+
+# Copy truststore into image
+COPY src/main/resources/rds/rds-truststore.jks /app/rds/
+
+COPY target/account-service-0.0.1-SNAPSHOT.jar app.jar
+
+EXPOSE 8083
+
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+### Configure JVM with Truststore
+
+**Set JVM system properties:**
+
+```bash
+# Option 1: Environment variables (ECS task definition)
+JAVA_TOOL_OPTIONS="-Djavax.net.ssl.trustStore=/app/rds/rds-truststore.jks \
+  -Djavax.net.ssl.trustStorePassword=<PASSWORD> \
+  -Djavax.net.ssl.trustStoreType=PKCS12"
+
+# Option 2: Application properties (application.yml)
+spring:
+  datasource:
+    hikari:
+      data-source-properties:
+        sslMode: VERIFY_IDENTITY
+        serverTimezone: UTC
+```
+
+### Verify JVM Properties in Container
+
+**Check running JVM process:**
+
+```bash
+# Inside ECS container
+cat /proc/1/cmdline | tr '\0' ' '
+
+# Output should show:
+# java ... -Djavax.net.ssl.trustStore=/app/rds/rds-truststore.jks ...
+```
+
+---
+
+## Primary/Replica Datasources
+
+### Definition
+
+**Primary Datasource** connects to RDS Primary for writes and strong reads. **Replica Datasource** connects to RDS Replica for read-only queries. **Routing** intelligently chooses based on operation type.
+
+### What You Implemented
+
+**Architecture:**
+
+```
+Account Service
+       |
+       ├─ Primary Hikari Pool
+       │  └─ RDS Primary (read-write)
+       │
+       └─ Replica Hikari Pool
+          └─ RDS Replica (read-only)
+
+Routing Logic:
+├─ Create account → Primary
+├─ Deposit/Withdraw → Primary
+├─ Balance check → Primary (strong read)
+├─ Mini statement → Replica
+├─ Full statement → Replica
+└─ Validate transfer → Replica
+```
+
+**Custom Datasource Configuration:**
+
+```java
+@Configuration
+public class DataSourceConfiguration {
+    
+    @Bean(name = "primaryDataSource")
+    public DataSource primaryDataSource(
+        @Value("${db.primary.url}") String url,
+        @Value("${db.primary.username}") String username,
+        @Value("${db.primary.password}") String password) {
+        
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(url);
+        config.setUsername(username);
+        config.setPassword(password);
+        config.setMaximumPoolSize(10);
+        config.setMinimumIdle(5);
+        config.setConnectionTimeout(30000);
+        config.setIdleTimeout(600000);
+        config.setMaxLifetime(1800000);
+        
+        return new HikariDataSource(config);
+    }
+    
+    @Bean(name = "replicaDataSource")
+    public DataSource replicaDataSource(
+        @Value("${db.replica.url}") String url,
+        @Value("${db.replica.username}") String username,
+        @Value("${db.replica.password}") String password) {
+        
+        // Same HikariConfig as primary
+        // Different URL pointing to replica
+    }
+    
+    @Bean(name = "routingDataSource")
+    public DataSource routingDataSource(
+        @Qualifier("primaryDataSource") DataSource primary,
+        @Qualifier("replicaDataSource") DataSource replica) {
+        
+        return new RoutingDataSource(primary, replica);
+    }
+}
+```
+
+**Routing Data Source Implementation:**
+
+```java
+public class RoutingDataSource extends AbstractRoutingDataSource {
+    
+    @Override
+    protected Object determineCurrentLookupKey() {
+        // Return "PRIMARY" or "REPLICA" based on current operation
+        DataSourceContext context = DataSourceContext.getContext();
+        return context != null ? context.getDataSourceType() : "PRIMARY";
+    }
+}
+```
+
+**Using the Routing:**
+
+```java
+@Service
+public class AccountService {
+    
+    @Autowired
+    private AccountRepository accountRepository;
+    
+    // Write operation → uses PRIMARY
+    @Transactional
+    public Account createAccount(CreateAccountRequest request) {
+        // @Transactional implies write, routes to PRIMARY
+        Account account = new Account();
+        account.setAccountType(request.getAccountType());
+        account.setBalance(request.getInitialDeposit());
+        return accountRepository.save(account);
+    }
+    
+    // Read operation → uses REPLICA
+    @ReadOnly  // Custom annotation routes to REPLICA
+    public List<Account> getMyAccounts() {
+        DataSourceContext.setCurrentDataSource("REPLICA");
+        try {
+            return accountRepository.findByUserId(getCurrentUserId());
+        } finally {
+            DataSourceContext.clear();
+        }
+    }
+    
+    // Strong read → uses PRIMARY
+    @PrimaryRead  // Custom annotation for strong consistency
+    public BigDecimal getBalance(String accountNumber) {
+        // CRITICAL: Balance must be current, not stale
+        // Use PRIMARY to ensure latest data
+        DataSourceContext.setCurrentDataSource("PRIMARY");
+        try {
+            return accountRepository.findByAccountNumber(accountNumber)
+                .map(Account::getBalance)
+                .orElse(BigDecimal.ZERO);
+        } finally {
+            DataSourceContext.clear();
+        }
+    }
+}
+```
+
+### Routing Benefits
+
+```
+Performance:
+├─ Replica handles 80%+ of reads
+├─ Reduces load on primary
+├─ Scales read capacity independently
+└─ Primary reserved for writes
+
+Consistency:
+├─ Strong reads use primary (latest data)
+├─ Weak reads use replica (eventual consistency)
+├─ Application controls consistency guarantees
+└─ Banking operations use strong reads
+```
+
+---
+
+## Production Database Setup
+
+### Definition
+
+**Production Setup** prevents accidental schema modifications and ensures data safety.
+
+### Configuration
+
+**Development (risky):**
+
+```yaml
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: update  # DANGEROUS: modifies production schema
+
+  sql:
+    init:
+      mode: always  # DANGEROUS: runs schema.sql on every restart
+```
+
+**Production (safe):**
+
+```yaml
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate  # Only validates, doesn't modify
+
+  sql:
+    init:
+      mode: never  # Never runs schema.sql automatically
+```
+
+### Why `ddl-auto: validate`
+
+```
+validate:
+├─ Checks that current RDS schema matches entity mappings
+├─ Does NOT modify database
+├─ Fails startup if schema mismatch detected
+└─ Prevents accidental data loss
+
+update:
+├─ Modifies production database automatically
+├─ Can corrupt data if mapping incorrect
+├─ Not safe for production
+└─ Reserved for development only
+```
+
+### Why `init-mode: never`
+
+```
+always:
+├─ Executes schema.sql on every restart
+├─ Problem: Idempotency not guaranteed
+├─ Example: DROP TABLE → CREATE TABLE → insert data
+├─ On second restart: DROP TABLE deletes all data!
+└─ Catastrophic for production
+
+never:
+├─ schema.sql ignored
+├─ Flyway/Liquibase used for schema management
+├─ Versioned migrations in version control
+├─ Controlled, audited changes
+└─ Production-safe
+```
+
+---
+
+## Redis Integration
+
+### Definition
+
+**Redis** is an in-memory data store used for caching account balances to reduce RDS query load.
+
+### Configuration
+
+```yaml
+spring:
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 20
+          max-idle: 10
+          min-idle: 5
+```
+
+### ECS Environment Variables
+
+```
+REDIS_HOST=10.0.1.87
+REDIS_PORT=6379
+```
+
+### Balance Caching Pattern
+
+```
+GET balance
+    ↓
+Query Redis
+    |
+    +-- HIT → Return cached balance (fast)
+    │
+    +-- MISS
+         ↓
+      Query Primary RDS (strong read)
+         ↓
+      Update Redis cache (30 min TTL)
+         ↓
+      Return balance
+```
+
+### Implementation
+
+```java
+@Service
+public class BalanceCacheService {
+    
+    @Autowired
+    private StringRedisTemplate redis;
+    
+    @Autowired
+    private AccountRepository accountRepository;
+    
+    private static final String BALANCE_KEY_PREFIX = "balance:";
+    private static final long CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+    
+    @PrimaryRead
+    public BigDecimal getBalance(String accountNumber) {
+        // Check cache first
+        String cachedBalance = redis.opsForValue()
+            .get(BALANCE_KEY_PREFIX + accountNumber);
+        
+        if (cachedBalance != null) {
+            logger.debug("Balance cache HIT for account: {}", accountNumber);
+            return new BigDecimal(cachedBalance);
+        }
+        
+        // Cache miss: query primary database
+        logger.debug("Balance cache MISS for account: {}", accountNumber);
+        
+        BigDecimal balance = accountRepository
+            .findByAccountNumber(accountNumber)
+            .map(Account::getBalance)
+            .orElse(BigDecimal.ZERO);
+        
+        // Update cache
+        redis.opsForValue().set(
+            BALANCE_KEY_PREFIX + accountNumber,
+            balance.toString(),
+            java.time.Duration.ofSeconds(CACHE_TTL / 1000));
+        
+        return balance;
+    }
+    
+    // Invalidate cache on deposit/withdraw
+    public void invalidateBalance(String accountNumber) {
+        redis.delete(BALANCE_KEY_PREFIX + accountNumber);
+        logger.debug("Cache invalidated for account: {}", accountNumber);
+    }
+}
+```
+
+---
+
+## Kafka Integration
+
+### Definition
+
+**Kafka** enables asynchronous event-driven communication. Account Service publishes transaction events for downstream services.
+
+### Configuration
+
+**Problem encountered:**
+
+```
+Initial config: localhost:9092
+Error: Connection to node -1 (localhost/127.0.0.1:9092) could not be established
+
+Cause: Inside ECS container, localhost = container itself, not EC2 host
+```
+
+**Solution:**
+
+```yaml
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
+    # ECS environment provides: 10.0.1.87:9092 (EC2 private IP)
+    
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+```
+
+### Events Published
+
+```
+TransactionEvent:
+├─ Type: DEPOSIT, WITHDRAWAL, TRANSFER
+├─ AccountNumber
+├─ Amount
+├─ Timestamp
+└─ TransactionReference
+
+Topic: account-transactions
+
+Consumer: Transaction Service
+```
+
+---
+
+## Config Server Integration
+
+### What You Verified
+
+```
+Account Service fetches config from:
+http://citicore-config-alb-1654378622.ap-south-1.elb.amazonaws.com
+
+Config returned:
+├─ account-service.yml (service-specific)
+├─ application.yml (shared config)
+└─ configClient (Spring property source)
+```
+
+---
+
+## Eureka Service Discovery
+
+### Verification
+
+**Account Service registers successfully:**
+
+```
+Logs show:
+"Registering application ACCOUNT-SERVICE with eureka with status UP"
+"registration status: 204"
+
+Eureka reports:
+├─ ACCOUNT-SERVICE: 1 instance
+├─ AUTH-SERVICE: 1 instance
+└─ USER-SERVICE: 1 instance
+```
+
+---
+
+## Docker Build & ECR
+
+### What You Implemented
+
+**Image Creation:**
+
+```
+Maven build
+    ↓
+account-service-0.0.1-SNAPSHOT.jar
+    ↓
+Docker build
+    ↓
+citicore/account-service:1.4
+    ↓
+Amazon ECR push
+    ↓
+580655778303.dkr.ecr.ap-south-1.amazonaws.com/citicore/account-service:1.4
+```
+
+**Image Digest:**
+
+```
+sha256:5ed050cb034d42bc5d42ce793d5e937232cc00bd1d8bcf70c9bea2099767d8a1
+```
+
+---
+
+## ECS Task Definition
+
+### Configuration
+
+```yaml
+Task Definition: citicore-account-service:7
+
+Compute:
+  Launch Type: FARGATE
+  OS: Linux
+  Architecture: X86_64
+  CPU: 0.5 vCPU
+  Memory: 1 GB
+  Network Mode: awsvpc
+
+Container:
+  Name: citicore-account-service
+  Image: ECR URI:1.4
+  Port: 8083
+  Protocol: TCP
+
+IAM Roles:
+  Task Role: citicore-ecs-task-role
+  Execution Role: citicore-ecs-task-execution-role
+
+Features:
+  ECS Exec: Enabled (for debugging)
+```
+
+### Why 0.5 vCPU & 1 GB Memory
+
+```
+Account Service resource usage:
+├─ Spring Boot base: ~150 MB
+├─ Spring Cloud libraries: ~200 MB
+├─ Hikari connection pools (2): ~100 MB
+├─ Application data in memory: ~50 MB
+├─ Safety margin: ~500 MB
+└─ Total: ~1000 MB (1 GB)
+
+CPU: 0.5 vCPU
+├─ Account operations: light to moderate
+├─ JSON serialization: fast
+├─ Database queries: bounded by RDS
+├─ 0.5 vCPU sufficient for single instance
+└─ Additional instances via auto-scaling
+```
+
+---
+
+## ECS Networking & Subnets
+
+### Networking Configuration
+
+**VPC:**
+
+```
+citicore-vpc (vpc-0d064f45265cbcdad)
+├─ Public subnets: 10.0.1.0/24 (ap-south-1a), 10.0.2.0/24 (ap-south-1b)
+├─ Private subnets: 10.0.11.0/24, 10.0.12.0/24
+└─ DB subnets: 10.0.21.0/24, 10.0.22.0/24
+```
+
+**Task Placement:**
+
+```
+Public Subnets (cost-conscious development setup):
+├─ No NAT Gateway needed
+├─ EC2 docker services (Kafka, Redis) reachable
+├─ Each task receives public IP (optional)
+└─ Acceptable for dev/test, not recommended for production
+```
+
+### ENI Assignment
+
+**With awsvpc network mode:**
+
+```
+Each Fargate task receives:
+├─ ENI (Elastic Network Interface)
+├─ Private IP: 10.0.1.250 or 10.0.2.132 (examples)
+├─ Security group: citicore-ecs-sg
+└─ VPC routing table for connectivity
+```
+
+---
+
+## Application Load Balancer
+
+### Configuration
+
+```
+ALB: citicore-account-alb
+
+DNS:
+citicore-account-alb-624325590.ap-south-1.elb.amazonaws.com
+
+Listener:
+├─ Protocol: HTTP
+├─ Port: 8083
+
+Target Group: citicore-account-tg
+├─ Target Type: IP
+├─ Port: 8083
+├─ Protocol: HTTP
+└─ Health Check: /actuator/health (every 30s)
+```
+
+### Traffic Flow
+
+```
+Internet Client
+    ↓
+HTTP :8083 request
+    ↓
+ALB (citicore-alb-sg)
+    ↓
+Target Group
+    ↓
+ECS Task IP:8083
+    ↓
+Spring Boot Account Service
+```
+
+---
+
+## Security Group Configuration
+
+### ALB Security Group (citicore-alb-sg)
+
+```
+Inbound Rules:
+├─ TCP 80 (HTTP): 0.0.0.0/0 (internet)
+├─ TCP 443 (HTTPS): 0.0.0.0/0 (internet)
+├─ TCP 8083 (Account Service): 0.0.0.0/0 (internet)
+└─ TCP 8082 (User Service): 0.0.0.0/0 (internet)
+
+Outbound:
+└─ All traffic to 0.0.0.0/0
+```
+
+### ECS Security Group (citicore-ecs-sg)
+
+```
+Inbound Rules:
+├─ TCP 8083 from citicore-alb-sg (ALB to ECS)
+├─ TCP 8082 from citicore-alb-sg (ALB to ECS)
+├─ TCP 8081 from citicore-auth-alb-sg (Auth to Account)
+├─ TCP 8761 from citicore-ecs-sg (Eureka)
+└─ TCP 8888 from citicore-alb-sg (Config Server)
+```
+
+### Security Group Model
+
+```
+              Internet
+                |
+                | TCP 8083
+                ↓
+    ┌─────────────────────────┐
+    │  citicore-alb-sg        │
+    │ (ALB security group)    │
+    └────────────┬────────────┘
+                 |
+                 | TCP 8083
+                 ↓
+    ┌─────────────────────────┐
+    │  citicore-ecs-sg        │
+    │ (ECS security group)    │
+    └────────────┬────────────┘
+                 |
+                 ↓
+         ECS Fargate :8083
+```
+
+---
+
+## ALB & ECS Connectivity Troubleshooting
+
+### The Problem You Encountered
+
+**Symptoms:**
+
+```
+1. External curl times out
+   curl: (28) Connection timed out
+
+2. Target health shows Unhealthy
+   Reason: Request timed out
+
+3. Application inside container works
+   curl http://localhost:8083/actuator/health → 200 OK
+```
+
+**Investigation Process:**
+
+```
+Step 1: Application level
+├─ ECS Exec into container
+├─ Test localhost:8083 → WORKS ✓
+├─ Test 10.0.2.132:8083 → WORKS ✓
+└─ Application is healthy
+
+Step 2: Container networking
+├─ Check /proc/1/net/tcp
+├─ Port 8083 (0x1F93) listening ✓
+└─ Tomcat listening on 0.0.0.0:8083
+
+Step 3: External connectivity
+├─ curl from external host
+├─ Target group shows: Request timed out ✗
+└─ Problem is external path, not application
+
+Step 4: Security groups
+├─ ECS SG rule for 8083 from ALB SG: exists ✓
+├─ ALB SG itself: citicore-ecs-sg ✗ WRONG!
+└─ Found the problem!
+```
+
+### Root Cause
+
+**Incorrect Security Group:**
+
+```
+ALB was configured with:
+└─ citicore-ecs-sg (ECS security group)
+
+Should have been:
+└─ citicore-alb-sg (ALB security group)
+```
+
+**Why This Broke Everything:**
+
+```
+When ALB uses citicore-ecs-sg:
+├─ ALB itself appears to be an ECS task
+├─ Traffic path: Internet → ALB (citicore-ecs-sg) → Target
+├─ ECS SG rule: "Allow from citicore-alb-sg"
+├─ ALB is NOT using citicore-alb-sg
+├─ Rule does not match
+├─ Connection blocked by security group
+└─ Health checks timeout, task replaced
+
+Correct setup uses citicore-alb-sg:
+├─ Traffic path: Internet → ALB (citicore-alb-sg) → ECS (citicore-ecs-sg)
+├─ ALB SG rule inbound: Allow 0.0.0.0/0:8083 (accept internet)
+├─ ECS SG rule inbound: Allow citicore-alb-sg:8083 (accept from ALB)
+├─ Connection succeeds
+└─ Health checks pass, task stays running
+```
+
+### Solution
+
+**Change ALB security group:**
+
+```bash
+# Identify ALB network interface
+aws ec2 describe-network-interfaces \
+  --filters Name=attachment.instance-id,Values=<ALB_ENI> \
+  --query 'NetworkInterfaces[0].NetworkInterfaceId'
+
+# Change security group
+aws ec2 modify-network-interface-attribute \
+  --network-interface-id eni-xxxxxxx \
+  --groups sg-09208846c8786e541  # citicore-alb-sg
+
+# Verify
+aws ec2 describe-network-interfaces \
+  --network-interface-ids eni-xxxxxxx \
+  --query 'NetworkInterfaces[0].Groups'
+```
+
+**Result after fix:**
+
+```
+Target Health: Changed to "Healthy"
+Health Check Success: 30 seconds later
+ECS Task: Stopped being replaced
+External Request: HTTP 200 OK
+```
+
+---
+
+## Health Monitoring
+
+### Final Health Response
+
+```json
+{
+  "status": "UP",
+  "components": {
+    "binders": {"status": "UP"},           // Kafka
+    "clientConfigServer": {"status": "UP"}, // Config Server
+    "db": {"status": "UP"},                 // Primary + Replica
+    "discoveryComposite": {"status": "UP"}, // Eureka
+    "diskSpace": {"status": "UP"},
+    "ping": {"status": "UP"},
+    "redis": {"status": "UP"},
+    "primaryDataSource": {"status": "UP"},
+    "replicaDataSource": {"status": "UP"},
+    "routingDataSource": {
+      "status": "UP",
+      "details": {
+        "PRIMARY": "UP",
+        "REPLICA": "UP"
+      }
+    }
+  }
+}
+```
+
+### Component Details
+
+```
+Kafka:
+├─ Spring Cloud Bus listener active
+├─ Can publish/consume events
+└─ Status: UP ✓
+
+Config Server:
+├─ account-service.yml loaded
+├─ application.yml loaded
+└─ Status: UP ✓
+
+Database:
+├─ Primary connection pool: UP
+├─ Replica connection pool: UP
+├─ Both using VERIFY_IDENTITY TLS
+└─ Status: UP ✓
+
+Service Discovery:
+├─ ACCOUNT-SERVICE registered
+├─ AUTH-SERVICE discovered
+├─ USER-SERVICE discovered
+└─ Status: UP ✓
+
+Redis:
+├─ Connected to 10.0.1.87:6379
+├─ Health check responding
+└─ Status: UP ✓
+```
+
+---
+
+## Account Service APIs
+
+### Base Path & Endpoints
+
+```
+Base URL: /api/v1/accounts
+
+GET /actuator/health
+└─ Health check
+
+POST /api/v1/accounts/create
+└─ Create new account
+
+GET /api/v1/accounts/my-accounts
+└─ List authenticated user's accounts
+
+GET /api/v1/accounts/balance/{accNo}
+└─ Get account balance (strong read)
+
+GET /api/v1/accounts/mini-statement/{accNo}
+└─ Last 5 transactions
+
+GET /api/v1/accounts/statement/{accNo}?page=0&size=10
+└─ Paginated transaction history
+
+POST /api/v1/accounts/deposit
+└─ Credit account
+
+POST /api/v1/accounts/withdraw
+└─ Debit account (with pessimistic lock)
+
+GET /api/v1/accounts/validate-transfer?accNo={accNo}&amount={amount}
+└─ Check if transfer possible
+```
+
+---
+
+## Banking Operations
+
+### Create Account
+
+**Request:**
+
+```bash
+curl -X POST http://account-alb:8083/api/v1/accounts/create \
+  -H "Authorization: Bearer JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "accountType": "SAVINGS",
+    "initialDeposit": 10000
+  }'
+```
+
+**Response:**
+
+```json
+{
+  "accountNumber": "CITI000000000001",
+  "accountType": "SAVINGS",
+  "balance": 10000,
+  "status": "ACTIVE",
+  "createdAt": "2026-08-30T10:00:00Z"
+}
+```
+
+**Routing: PRIMARY** (write operation)
+
+### Get Balance
+
+**Request:**
+
+```bash
+curl -X GET http://account-alb:8083/api/v1/accounts/balance/CITI000000000001 \
+  -H "Authorization: Bearer JWT"
+```
+
+**Response:**
+
+```json
+{
+  "balance": 10000
+}
+```
+
+**Routing: PRIMARY** (strong read with caching)
+
+### Deposit
+
+**Request:**
+
+```bash
+curl -X POST http://account-alb:8083/api/v1/accounts/deposit \
+  -H "Authorization: Bearer JWT" \
+  -d '{
+    "accNo": "CITI000000000001",
+    "amount": 5000,
+    "txnRef": "DEP_001"
+  }'
+```
+
+**Flow:**
+
+```
+1. Validate account exists
+2. Route to PRIMARY
+3. Update balance: 10000 + 5000 = 15000
+4. Insert transaction record
+5. Invalidate Redis cache
+6. Publish TransactionEvent to Kafka
+7. Return success
+```
+
+**Routing: PRIMARY** (write)
+
+### Withdraw
+
+**Request:**
+
+```bash
+curl -X POST http://account-alb:8083/api/v1/accounts/withdraw \
+  -H "Authorization: Bearer JWT" \
+  -d '{
+    "accNo": "CITI000000000001",
+    "amount": 2000,
+    "txnRef": "WIT_001"
+  }'
+```
+
+**Flow:**
+
+```
+1. Validate account exists
+2. Route to PRIMARY
+3. Acquire pessimistic lock on account (SELECT ... FOR UPDATE)
+4. Check balance >= 2000
+5. Update balance: 15000 - 2000 = 13000
+6. Insert transaction record
+7. Release lock
+8. Invalidate Redis cache
+9. Publish TransactionEvent to Kafka
+10. Return success
+```
+
+**Routing: PRIMARY** (write with locking)
+
+### Mini Statement
+
+**Request:**
+
+```bash
+curl -X GET http://account-alb:8083/api/v1/accounts/mini-statement/CITI000000000001 \
+  -H "Authorization: Bearer JWT"
+```
+
+**Response:**
+
+```json
+[
+  {"date": "2026-08-30", "type": "WITHDRAWAL", "amount": 2000, "balance": 13000},
+  {"date": "2026-08-30", "type": "DEPOSIT", "amount": 5000, "balance": 15000},
+  {"date": "2026-08-30", "type": "INITIAL", "amount": 10000, "balance": 10000}
+]
+```
+
+**Routing: REPLICA** (read-only)
+
+### Validate Transfer
+
+**Request:**
+
+```bash
+curl -X GET "http://account-alb:8083/api/v1/accounts/validate-transfer?accNo=CITI000000000001&amount=5000" \
+  -H "Authorization: Bearer JWT"
+```
+
+**Response:**
+
+```
+200 OK (can transfer 5000)
+or
+400 Bad Request (insufficient balance)
+```
+
+**Routing: REPLICA** (read-only, used by Transaction Service)
+
+---
+
+## Testing & Verification
+
+### Postman Environment Setup
+
+**Variables:**
+
+```
+baseUrl: http://citicore-account-alb-624325590.ap-south-1.elb.amazonaws.com:8083
+token: (JWT from auth service)
+accountNo: (created in test 03)
+```
+
+### Test Sequence
+
+```
+01. GET /actuator/health
+    ├─ Verify service running
+    └─ Check all components UP
+
+02. POST /api/v1/accounts/create
+    ├─ Create account
+    ├─ Save accountNo for later tests
+    └─ Verify initialDeposit applied
+
+03. GET /api/v1/accounts/my-accounts
+    ├─ List accounts
+    └─ Verify account appears
+
+04. GET /api/v1/accounts/balance/{accountNo}
+    ├─ Query balance
+    ├─ Verify cache behavior
+    └─ Should return initialDeposit
+
+05. GET /api/v1/accounts/mini-statement/{accountNo}
+    ├─ Get last 5 transactions
+    ├─ Should show INITIAL transaction
+    └─ Routes to REPLICA
+
+06. POST /api/v1/accounts/deposit
+    ├─ Deposit 5000
+    ├─ Balance becomes: 10000 + 5000 = 15000
+    └─ Verify transaction record created
+
+07. GET /api/v1/accounts/balance (after deposit)
+    ├─ Verify balance updated
+    └─ Check cache invalidated
+
+08. POST /api/v1/accounts/withdraw
+    ├─ Withdraw 2000
+    ├─ Balance becomes: 15000 - 2000 = 13000
+    └─ Verify pessimistic lock works
+
+09. GET /api/v1/accounts/statement (paginated)
+    ├─ Get full history
+    ├─ Should show INITIAL, DEPOSIT, WITHDRAW
+    └─ Routes to REPLICA
+
+10. GET /api/v1/accounts/validate-transfer
+    ├─ Check if can transfer 5000
+    ├─ Should return 200 (13000 > 5000)
+    └─ Routes to REPLICA
+
+11. POST /api/v1/accounts/deposit (duplicate)
+    ├─ Use same txnRef as test 06
+    ├─ Should not apply duplicate
+    └─ Verify idempotency
+```
+
+---
+
+## Real Issues & Solutions
+
+### Issue #1: ALB Wrong Security Group
+
+**Problem:**
+
+```
+External: timeout
+Target group: Unhealthy
+Application: UP
+```
+
+**Root Cause:**
+
+```
+ALB attached to citicore-ecs-sg instead of citicore-alb-sg
+```
+
+**Solution:**
+
+```
+Detach citicore-ecs-sg from ALB network interface
+Attach citicore-alb-sg to ALB network interface
+Result: Target becomes healthy within 30 seconds
+```
+
+### Issue #2: Container localhost != EC2 localhost
+
+**Problem:**
+
+```
+Kafka config: localhost:9092
+Error: Connection to node -1 (localhost/127.0.0.1:9092) could not be established
+```
+
+**Root Cause:**
+
+```
+Inside ECS container, localhost = container, not EC2 host where Kafka runs
+```
+
+**Solution:**
+
+```
+Use EC2 private IP: 10.0.1.87:9092
+Environment variable: KAFKA_BOOTSTRAP_SERVERS=10.0.1.87:9092
+Result: Kafka connection succeeds
+```
+
+### Issue #3: Java Doesn't Trust RDS CA
+
+**Problem:**
+
+```
+SSLHandshakeException: certificate_unknown
+CertPathValidatorException: Path does not chain with any of the trust anchors
+```
+
+**Root Cause:**
+
+```
+AWS RDS CA not in Java's default truststore
+```
+
+**Solution:**
+
+```
+1. Create truststore: rds-truststore.jks
+2. Import AWS RDS CA
+3. Configure JVM: -Djavax.net.ssl.trustStore=/app/rds/rds-truststore.jks
+4. Set password: -Djavax.net.ssl.trustStorePassword=xxx
+5. Result: TLS handshake succeeds, VERIFY_IDENTITY works
+```
+
+---
+
+## Troubleshooting Methodology
+
+### Layer-by-Layer Debugging
+
+**For Application Issues:**
+
+```
+1. ECS task Running?
+   └─ Check ECS console
+
+2. Java process running?
+   └─ ECS Exec → ps aux | grep java
+
+3. Tomcat listening on 8083?
+   └─ ECS Exec → netstat -tlnp | grep 8083
+
+4. localhost:8083 works?
+   └─ ECS Exec → curl http://localhost:8083/actuator/health
+
+5. task-private-IP:8083 works?
+   └─ ECS Exec → curl http://10.0.2.132:8083/actuator/health
+
+6. Target group Healthy?
+   └─ AWS console → target group → check health status
+
+7. ALB can reach target?
+   └─ Security group rules: ALB SG → ECS SG on 8083
+
+8. External ALB DNS works?
+   └─ curl http://citicore-account-alb-624325590...com:8083/actuator/health
+```
+
+**For RDS Issues:**
+
+```
+1. RDS reachable?
+   └─ ping or telnet to RDS endpoint
+
+2. MySQL CLI works?
+   └─ mysql -h endpoint -u user -p
+
+3. VERIFY_CA works?
+   └─ mysql ... --ssl-mode=VERIFY_CA
+
+4. VERIFY_IDENTITY works?
+   └─ mysql ... --ssl-mode=VERIFY_IDENTITY
+
+5. Java truststore configured?
+   └─ Check JVM options in /proc/1/cmdline
+
+6. Hikari connection pool healthy?
+   └─ Check actuator/health datasource status
+
+7. Spring Boot connections working?
+   └─ Run database query through REST API
+```
+
+---
+
+## Interview-Ready Explanations
+
+### "Walk me through the complete Account Service deployment"
+
+**Response:**
+
+"Account Service is the core banking service managing accounts, balances, and transactions.
+
+**Deployment layers:**
+
+1. **Build & Containerization**: Java 17 Spring Boot application. Maven compiles to JAR (~200 MB with all dependencies including AWS SDK, Kafka, Spring Cloud). Docker packages with JRE, includes custom truststore for RDS TLS.
+
+2. **Registry**: Pushed to Amazon ECR. Image digest tracked for reproducibility.
+
+3. **ECS Deployment**: Task definition specifies 0.5 vCPU, 1 GB memory (adequate for single instance). Each Fargate task receives private IP via ENI.
+
+4. **Database Strategy**: Two Hikari connection pools—Primary for writes/strong reads, Replica for read-only queries. Routing is application-aware using custom DataSource.
+
+5. **Security Hardening**: RDS TLS with VERIFY_IDENTITY. Java truststore contains AWS RDS CA. Hibernate ddl-auto set to validate (no automatic modifications).
+
+6. **Load Balancing**: ALB listens on port 8083, routes via target group to ECS task. Security groups carefully separated: ALB SG accepts internet traffic, ECS SG accepts only from ALB SG.
+
+7. **Integration**: Registers with Eureka, fetches config from Config Server, publishes events to Kafka, caches balances in Redis.
+
+8. **Real Issue Solved**: ALB initially configured with wrong security group—caused external timeouts AND target health failures. Switching ALB to citicore-alb-sg fixed both symptoms immediately.
+
+**Key architectural decision**: Read/write routing allows replica to handle 80% of queries, reducing primary load while maintaining consistency for critical operations like balance checks."
+
+### "How do you handle strong reads vs eventual consistency reads?"
+
+**Response:**
+
+"Banking is split into two categories:
+
+**Strong Reads (must use PRIMARY):**
+- Balance checks (user needs current balance before transaction)
+- Withdrawal pre-validation (can't overdraft)
+- Transfer validation (recipient exists with sufficient balance)
+
+These route to PRIMARY RDS, ensuring latest data.
+
+**Weak/Eventual Consistency Reads (use REPLICA):**
+- Statement queries (user views past transactions—history doesn't change)
+- Account list queries (list of accounts doesn't change frequently)
+- Mini statement (last 5 transactions—timing lag acceptable)
+
+These route to REPLICA, scaling read load.
+
+**Implementation**: Custom routing DataSource with ThreadLocal context. Methods annotated @PrimaryRead or @ReadOnly control routing. Balance queries bypass Redis cache and hit primary directly—critical for correctness.
+
+**Performance benefit**: 80% of reads hit replica, only 20% hit primary. At scale, this difference is massive:
+- All reads on primary: Primary CPU 100%, replica idle
+- Split routing: Primary CPU 20%, replica CPU 80%
+
+For a million daily users, this is the difference between needing 10 primary instances vs 2 primary + 8 replica instances."
+
+### "What happened with the ALB security group issue?"
+
+**Response:**
+
+"This was a multi-symptom problem from a single misconfiguration:
+
+**Symptoms:**
+1. External curl times out (users can't reach service)
+2. Target group shows Unhealthy (ALB health checks fail)
+3. ECS task kept getting replaced (failed health checks)
+4. BUT application itself was completely healthy
+
+**Investigation Process:**
+- ECS Exec into container
+- Test localhost:8083 → works
+- Test 10.0.2.132:8083 → works
+- Conclusion: Application is healthy, problem is external connectivity
+
+- Check ECS security group: TCP 8083 from ALB SG exists
+- Check ALB itself: using citicore-ecs-sg ← WRONG
+
+**Root Cause:**
+The ALB network interface was attached to citicore-ecs-sg (ECS security group) instead of citicore-alb-sg (ALB security group). This broke the security group chain:
+
+```
+Internet → ALB (citicore-ecs-sg)
+          ↓
+ECS rule: Allow from citicore-alb-sg
+          ↓
+ALB is NOT using citicore-alb-sg, rule doesn't match
+          ↓
+Traffic blocked
+```
+
+**Fix:**
+Changed ALB network interface security group from citicore-ecs-sg to citicore-alb-sg.
+
+**Result:**
+Within 30 seconds, target became Healthy, external requests succeeded, task stopped being replaced.
+
+**Key Lesson:**
+Security group errors aren't always obvious. A single misconfigured SG can simultaneously:
+- Block external traffic (ALB can't receive)
+- Fail health checks (ALB can't reach target)
+- Trigger task replacement (ECS thinks task unhealthy)
+
+Layer-by-layer debugging was essential: tested at application level, container level, ECS level, ALB level until finding the network configuration problem."
+
+---
+
+## Key Takeaways
+
+```
+✅ Complete Banking Service Deployment
+   Account creation, deposits, withdrawals, balances
+
+✅ Database Security
+   TLS 1.3 VERIFY_IDENTITY
+   Java truststore for CA validation
+   Separate primary/replica datasources
+
+✅ Smart Routing
+   Writes → Primary
+   Strong reads → Primary (with caching)
+   Weak reads → Replica (scales load)
+
+✅ Real Production Issues Solved
+   ALB security group misconfiguration
+   Container localhost networking
+   Java RDS CA certificate trust
+
+✅ Banking-Grade Reliability
+   Pessimistic locking for withdrawals
+   Idempotent transaction references
+   Event-driven outbox pattern
+
+✅ Performance Optimization
+   Redis caching for balances
+   Read/write routing strategy
+   Connection pooling (Hikari)
+```
+
+---
